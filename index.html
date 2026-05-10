@@ -2657,39 +2657,91 @@ body{color:var(--text);font-family:'Exo 2',sans-serif;-webkit-font-smoothing:ant
      Quick reply on message hover (uses sender → fills Send SMS)
      ───────────────────────────────────────────────────────────── */
   function initMsgHoverActions() {
+    /* Inject CSS that makes the copy button always visible (subtle), full opacity on hover */
+    if (!document.getElementById("medAlwaysCopyStyle")) {
+      var s = document.createElement("style");
+      s.id = "medAlwaysCopyStyle";
+      s.textContent =
+        ".med-msg-actions{opacity:.55;transition:opacity .2s var(--med-ease-out)!important}" +
+        ".msg-list>*:hover .med-msg-actions,.am-row:hover .med-msg-actions,[id$='msgList']>*:hover .med-msg-actions{opacity:1!important}" +
+        ".med-msg-act{box-shadow:0 2px 8px rgba(0,0,0,.4)}" +
+        ".med-msg-act.copied{background:rgba(0,212,170,.25)!important;border-color:rgba(0,212,170,.6)!important;color:#00d4aa!important}";
+      document.head.appendChild(s);
+    }
+
+    function getMsgText(node) {
+      /* Prefer .msg-txt, fall back to whole node text minus any chip elements */
+      var t = node.querySelector(".msg-txt");
+      if (t) return t.textContent.trim();
+      /* Clone, strip our own buttons + small chips, then read text */
+      var clone = node.cloneNode(true);
+      clone.querySelectorAll(".med-msg-actions,.med-badge,.med-otp-pill,.msg-sndr,.msg-time,[class*=time],[class*=Time],[class*=date],[class*=Date],[class*=tag],[class*=Tag],[class*=chip],[class*=Chip]")
+        .forEach(function (e) { e.remove(); });
+      return (clone.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
     function decorate(node) {
-      if (node.__medAct) return;
-      var sender = node.querySelector(".msg-sndr");
-      if (!sender) return;
+      if (node.__medAct || node.nodeType !== 1) return;
+      /* Skip non-message wrappers (sentinel/loader/etc) */
+      var txt = getMsgText(node);
+      if (!txt || txt.length < 2) return;
       node.__medAct = true;
+
+      /* Ensure positioning context for absolute actions */
+      var cs = getComputedStyle(node);
+      if (cs.position === "static") node.style.position = "relative";
+
       var actions = ce("div", "med-msg-actions");
       var copy = ce("button", "med-msg-act", "⎘"); copy.title = "Copy message";
-      var reply = ce("button", "med-msg-act", "↩"); reply.title = "Quick reply (fills Send SMS)";
+      var sender = node.querySelector(".msg-sndr");
+      var reply = sender ? ce("button", "med-msg-act", "↩") : null;
+      if (reply) reply.title = "Quick reply (fills Send SMS)";
+
       on(copy, "click", function (e) {
-        e.stopPropagation();
-        var t = node.querySelector(".msg-txt"); if (!t) return;
-        try { navigator.clipboard.writeText(t.textContent.trim()); } catch (err) {}
-        copy.textContent = "✓"; setTimeout(function () { copy.textContent = "⎘"; }, 1000);
+        e.stopPropagation(); e.preventDefault();
+        var t = getMsgText(node);
+        try { navigator.clipboard.writeText(t); } catch (err) {
+          /* fallback for non-secure contexts */
+          var ta = document.createElement("textarea"); ta.value = t;
+          ta.style.position = "fixed"; ta.style.opacity = "0";
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand("copy"); } catch (e2) {}
+          ta.remove();
+        }
+        copy.classList.add("copied");
+        copy.textContent = "✓";
+        setTimeout(function () { copy.classList.remove("copied"); copy.textContent = "⎘"; }, 1100);
+        if (typeof window.toast === "function") window.toast("📋 Copied");
       });
-      on(reply, "click", function (e) {
-        e.stopPropagation();
+      if (reply) on(reply, "click", function (e) {
+        e.stopPropagation(); e.preventDefault();
         var num = sender.textContent.trim();
         var to = $("#sTo"); var msg = $("#sMsg");
         if (to) to.value = num;
         if (msg) msg.focus();
         var tab = $('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
       });
-      actions.appendChild(copy); actions.appendChild(reply);
+      actions.appendChild(copy);
+      if (reply) actions.appendChild(reply);
       node.appendChild(actions);
     }
-    ["msgList", "amList"].forEach(function (id) {
-      var c = document.getElementById(id); if (!c) return;
-      var mo = new MutationObserver(function () {
+
+    /* Cover both panes + any other message lists added later */
+    var SCAN_IDS = ["msgList", "amList"];
+    function scanAll() {
+      SCAN_IDS.forEach(function (id) {
+        var c = document.getElementById(id); if (!c) return;
         $$('#' + id + ' > *').forEach(decorate);
       });
+    }
+    SCAN_IDS.forEach(function (id) {
+      var c = document.getElementById(id); if (!c) return;
+      var mo = new MutationObserver(scanAll);
       mo.observe(c, { childList: true, subtree: true });
-      setTimeout(function () { $$('#' + id + ' > *').forEach(decorate); }, 1500);
     });
+    /* periodic safety net for nodes added in unusual ways */
+    setTimeout(scanAll, 1200);
+    setInterval(scanAll, 4000);
   }
 
   /* (kept as separate hook for future expansion) */
