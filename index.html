@@ -2657,91 +2657,137 @@ body{color:var(--text);font-family:'Exo 2',sans-serif;-webkit-font-smoothing:ant
      Quick reply on message hover (uses sender → fills Send SMS)
      ───────────────────────────────────────────────────────────── */
   function initMsgHoverActions() {
-    /* Inject CSS that makes the copy button always visible (subtle), full opacity on hover */
-    if (!document.getElementById("medAlwaysCopyStyle")) {
+    /* Inline chip copy button — placed right next to .msg-txt so it can't be clipped */
+    if (!document.getElementById("medCopyChipStyle")) {
       var s = document.createElement("style");
-      s.id = "medAlwaysCopyStyle";
+      s.id = "medCopyChipStyle";
       s.textContent =
-        ".med-msg-actions{opacity:.55;transition:opacity .2s var(--med-ease-out)!important}" +
-        ".msg-list>*:hover .med-msg-actions,.am-row:hover .med-msg-actions,[id$='msgList']>*:hover .med-msg-actions{opacity:1!important}" +
-        ".med-msg-act{box-shadow:0 2px 8px rgba(0,0,0,.4)}" +
-        ".med-msg-act.copied{background:rgba(0,212,170,.25)!important;border-color:rgba(0,212,170,.6)!important;color:#00d4aa!important}";
+        ".med-copy-chip,.med-reply-chip{" +
+          "display:inline-flex!important;align-items:center;gap:4px;" +
+          "margin:6px 6px 0 0;padding:3px 9px;" +
+          "border-radius:6px;font-size:10px;font-weight:800;letter-spacing:.5px;" +
+          "font-family:'Exo 2',sans-serif;cursor:pointer;vertical-align:middle;" +
+          "transition:transform .25s var(--med-ease-spring,cubic-bezier(.34,1.56,.64,1)),background .2s,border-color .2s;" +
+          "user-select:none;line-height:1.2;" +
+        "}" +
+        ".med-copy-chip{background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.35);color:#00d4ff;}" +
+        ".med-copy-chip:hover{background:rgba(0,212,255,.25);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,212,255,.25);}" +
+        ".med-copy-chip:active{transform:scale(.94);}" +
+        ".med-copy-chip.copied{background:rgba(0,212,170,.25)!important;border-color:rgba(0,212,170,.55)!important;color:#00d4aa!important;}" +
+        ".med-reply-chip{background:rgba(192,132,252,.12);border:1px solid rgba(192,132,252,.35);color:#c084fc;}" +
+        ".med-reply-chip:hover{background:rgba(192,132,252,.25);transform:translateY(-1px);box-shadow:0 4px 12px rgba(192,132,252,.25);}" +
+        ".med-copy-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;}";
       document.head.appendChild(s);
     }
 
-    function getMsgText(node) {
-      /* Prefer .msg-txt, fall back to whole node text minus any chip elements */
-      var t = node.querySelector(".msg-txt");
-      if (t) return t.textContent.trim();
-      /* Clone, strip our own buttons + small chips, then read text */
-      var clone = node.cloneNode(true);
-      clone.querySelectorAll(".med-msg-actions,.med-badge,.med-otp-pill,.msg-sndr,.msg-time,[class*=time],[class*=Time],[class*=date],[class*=Date],[class*=tag],[class*=Tag],[class*=chip],[class*=Chip]")
-        .forEach(function (e) { e.remove(); });
-      return (clone.textContent || "").replace(/\s+/g, " ").trim();
-    }
-
-    function decorate(node) {
-      if (node.__medAct || node.nodeType !== 1) return;
-      /* Skip non-message wrappers (sentinel/loader/etc) */
-      var txt = getMsgText(node);
-      if (!txt || txt.length < 2) return;
-      node.__medAct = true;
-
-      /* Ensure positioning context for absolute actions */
-      var cs = getComputedStyle(node);
-      if (cs.position === "static") node.style.position = "relative";
-
-      var actions = ce("div", "med-msg-actions");
-      var copy = ce("button", "med-msg-act", "⎘"); copy.title = "Copy message";
-      var sender = node.querySelector(".msg-sndr");
-      var reply = sender ? ce("button", "med-msg-act", "↩") : null;
-      if (reply) reply.title = "Quick reply (fills Send SMS)";
-
-      on(copy, "click", function (e) {
-        e.stopPropagation(); e.preventDefault();
-        var t = getMsgText(node);
-        try { navigator.clipboard.writeText(t); } catch (err) {
-          /* fallback for non-secure contexts */
-          var ta = document.createElement("textarea"); ta.value = t;
-          ta.style.position = "fixed"; ta.style.opacity = "0";
+    function copyText(text, btn, label) {
+      var ok = false;
+      try { navigator.clipboard.writeText(text); ok = true; } catch (err) {}
+      if (!ok) {
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0"; ta.style.left = "-9999px";
           document.body.appendChild(ta); ta.select();
-          try { document.execCommand("copy"); } catch (e2) {}
-          ta.remove();
-        }
-        copy.classList.add("copied");
-        copy.textContent = "✓";
-        setTimeout(function () { copy.classList.remove("copied"); copy.textContent = "⎘"; }, 1100);
-        if (typeof window.toast === "function") window.toast("📋 Copied");
-      });
-      if (reply) on(reply, "click", function (e) {
-        e.stopPropagation(); e.preventDefault();
-        var num = sender.textContent.trim();
-        var to = $("#sTo"); var msg = $("#sMsg");
-        if (to) to.value = num;
-        if (msg) msg.focus();
-        var tab = $('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
-      });
-      actions.appendChild(copy);
-      if (reply) actions.appendChild(reply);
-      node.appendChild(actions);
+          ok = document.execCommand("copy"); ta.remove();
+        } catch (e) {}
+      }
+      if (btn) {
+        var orig = label || btn.dataset.lbl || btn.textContent;
+        btn.dataset.lbl = orig;
+        btn.classList.add("copied");
+        btn.textContent = "✓ Copied";
+        clearTimeout(btn.__t);
+        btn.__t = setTimeout(function () { btn.classList.remove("copied"); btn.textContent = orig; }, 1200);
+      }
+      if (typeof window.toast === "function") window.toast(ok ? "📋 Copied to clipboard" : "❌ Copy failed");
+      return ok;
     }
 
-    /* Cover both panes + any other message lists added later */
-    var SCAN_IDS = ["msgList", "amList"];
-    function scanAll() {
-      SCAN_IDS.forEach(function (id) {
-        var c = document.getElementById(id); if (!c) return;
-        $$('#' + id + ' > *').forEach(decorate);
+    function decorateTxt(txtEl) {
+      if (!txtEl || txtEl.__medCopyBtn) return;
+      var raw = (txtEl.textContent || "").trim();
+      if (!raw || raw.length < 2) return;
+      txtEl.__medCopyBtn = true;
+
+      /* Find sender for optional reply chip */
+      var bubble = txtEl.closest('[class*="msg"], [class*="bub"], [class*="row"], [class*="item"], [class*="card"]') || txtEl.parentElement;
+      var sender = bubble ? bubble.querySelector(".msg-sndr") : null;
+
+      var row = document.createElement("div");
+      row.className = "med-copy-row";
+
+      var copy = document.createElement("button");
+      copy.className = "med-copy-chip";
+      copy.textContent = "⎘ Copy";
+      copy.title = "Copy message text";
+      copy.addEventListener("click", function (e) {
+        e.stopPropagation(); e.preventDefault();
+        copyText((txtEl.textContent || "").trim(), copy, "⎘ Copy");
       });
+      row.appendChild(copy);
+
+      if (sender) {
+        var reply = document.createElement("button");
+        reply.className = "med-reply-chip";
+        reply.textContent = "↩ Reply";
+        reply.title = "Quick reply — fills Send SMS";
+        reply.addEventListener("click", function (e) {
+          e.stopPropagation(); e.preventDefault();
+          var num = sender.textContent.trim();
+          var to = document.getElementById("sTo"); var msg = document.getElementById("sMsg");
+          if (to) to.value = num;
+          if (msg) msg.focus();
+          var tab = document.querySelector('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
+        });
+        row.appendChild(reply);
+      }
+
+      /* Insert directly after the text element so it's part of normal flow */
+      if (txtEl.nextSibling) txtEl.parentNode.insertBefore(row, txtEl.nextSibling);
+      else txtEl.parentNode.appendChild(row);
     }
-    SCAN_IDS.forEach(function (id) {
+
+    function scanAll() {
+      /* Primary: every .msg-txt anywhere on the page */
+      $$('.msg-txt').forEach(decorateTxt);
+      /* Fallback: any direct child of #amList that doesn't have .msg-txt — treat the row itself as text container */
+      var am = document.getElementById("amList");
+      if (am) {
+        $$('#amList > *').forEach(function (row) {
+          if (row.__medCopyBtn) return;
+          if (row.querySelector(".msg-txt")) return; /* already handled */
+          var clone = row.cloneNode(true);
+          clone.querySelectorAll(".med-copy-row,.med-msg-actions,.med-badge,.med-otp-pill,.msg-sndr,[class*=time],[class*=Time],[class*=date],[class*=Date]").forEach(function (e) { e.remove(); });
+          var txt = (clone.textContent || "").replace(/\s+/g, " ").trim();
+          if (!txt || txt.length < 2) return;
+          row.__medCopyBtn = true;
+          var btn = document.createElement("button");
+          btn.className = "med-copy-chip";
+          btn.textContent = "⎘ Copy";
+          btn.title = "Copy this message";
+          btn.style.float = "right";
+          btn.style.marginLeft = "auto";
+          btn.addEventListener("click", function (e) {
+            e.stopPropagation(); e.preventDefault();
+            var c = row.cloneNode(true);
+            c.querySelectorAll(".med-copy-row,.med-copy-chip,.med-msg-actions,.med-badge,.med-otp-pill,.msg-sndr,[class*=time],[class*=Time],[class*=date],[class*=Date]").forEach(function (e) { e.remove(); });
+            copyText((c.textContent || "").replace(/\s+/g, " ").trim(), btn, "⎘ Copy");
+          });
+          row.appendChild(btn);
+        });
+      }
+    }
+
+    /* Observe both message containers for new bubbles */
+    ["msgList", "amList"].forEach(function (id) {
       var c = document.getElementById(id); if (!c) return;
-      var mo = new MutationObserver(scanAll);
+      var mo = new MutationObserver(function () { scanAll(); });
       mo.observe(c, { childList: true, subtree: true });
     });
-    /* periodic safety net for nodes added in unusual ways */
-    setTimeout(scanAll, 1200);
-    setInterval(scanAll, 4000);
+    /* Initial + safety re-scans */
+    setTimeout(scanAll, 800);
+    setTimeout(scanAll, 2000);
+    setInterval(scanAll, 3000);
   }
 
   /* (kept as separate hook for future expansion) */
