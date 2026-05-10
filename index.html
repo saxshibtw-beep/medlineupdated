@@ -1203,5 +1203,2438 @@ body{color:var(--text);font-family:'Exo 2',sans-serif;-webkit-font-smoothing:ant
   });
 })();
 </script>
+<script>
+/* ─────────────────────────────────────────────────────────────
+   Device Sharing — password-protected, revokable share links.
+   Admin: new "Share" tab to generate/revoke links per device.
+   Viewer: open .../?s=<token> → password gate → read-only view.
+   ───────────────────────────────────────────────────────────── */
+(function () {
+  var SHARE_NS = "medline_shares";
+
+  /* ── helpers ─────────────────────────────────────────────── */
+  async function sha256(s) {
+    var buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+    return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+  }
+  function b64url(s) {
+    return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64url(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    return decodeURIComponent(escape(atob(s)));
+  }
+  function bytesToB64url(bytes) {
+    var s = ""; for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function b64urlToBytes(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    var bin = atob(s); var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function deriveKey(password, salt) {
+    var baseKey = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(password), { name: "PBKDF2" }, false, ["deriveKey"]
+    );
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: 200000, hash: "SHA-256" },
+      baseKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+    );
+  }
+  async function encryptShare(payload, password) {
+    var salt = crypto.getRandomValues(new Uint8Array(16));
+    var iv   = crypto.getRandomValues(new Uint8Array(12));
+    var key  = await deriveKey(password, salt);
+    var ct   = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: iv }, key, new TextEncoder().encode(JSON.stringify(payload))
+    ));
+    var combined = new Uint8Array(salt.length + iv.length + ct.length);
+    combined.set(salt, 0); combined.set(iv, salt.length); combined.set(ct, salt.length + iv.length);
+    return bytesToB64url(combined);
+  }
+  async function decryptShare(token, password) {
+    var bytes = b64urlToBytes(token);
+    if (bytes.length < 29) throw new Error("bad token");
+    var salt = bytes.slice(0, 16);
+    var iv   = bytes.slice(16, 28);
+    var ct   = bytes.slice(28);
+    var key  = await deriveKey(password, salt);
+    var pt   = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, ct);
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+  function randId(n) {
+    var a = new Uint8Array(n || 9); crypto.getRandomValues(a);
+    return Array.from(a).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+  }
+  function escHtml(s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function getFbUrl() {
+    var v = (document.getElementById("fbUrl") || {}).value || "";
+    if (!v) { try { v = localStorage.getItem("medline_fb_url") || ""; } catch (e) {} }
+    return String(v).trim().replace(/\/+$/, "");
+  }
+  function curDevId() {
+    var el = document.querySelector(".dev-item.sel .dev-i");
+    return el ? el.textContent.trim() : "";
+  }
+
+  /* ── share-token detection ───────────────────────────────── */
+  function getShareToken() {
+    try {
+      var u = new URL(window.location.href);
+      var qs = u.searchParams.get("s");
+      if (qs) return qs;
+      var hm = u.hash.match(/^#s\/(.+)$/);
+      if (hm) return hm[1];
+      var pm = u.pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+      if (pm && /^[A-Za-z0-9_-]{20,}$/.test(pm)) return pm;
+    } catch (e) {}
+    return null;
+  }
+  var shareToken = getShareToken();
+  var shareData  = null; /* populated only after successful decrypt */
+  var IS_VIEWER  = !!shareToken;
+
+  if (IS_VIEWER) initViewer();
+  else if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(initAdmin, 600); });
+  else setTimeout(initAdmin, 600);
+
+  /* ─────────────────────────────────────────────────────────
+     VIEWER MODE
+     ───────────────────────────────────────────────────────── */
+  function initViewer() {
+    function go() {
+      var st = document.createElement("style");
+      st.textContent =
+        "#setup{display:none!important}" +
+        ".tabs .tab[data-tabname='nuke'],.tabs .tab[data-tabname='forwarding'],.tabs .tab[data-tabname='allmsgs']{display:none!important}" +
+        "#shareTab{display:none!important}" +
+        ".sb-footer,.td-r{display:none!important}" +
+        ".tb-btn[onclick*='bulkModal'],.tb-btn[onclick*='exportAllMsgs'],.tb-btn[onclick*='autoPinAll']{display:none!important}" +
+        "#pane-nuke,#pane-forwarding,#pane-allmsgs,#pane-sharing{display:none!important}" +
+        ".mbtn-del-all,button[onclick*='confirmDelAllMsgs']{display:none!important}" +
+        ".dev-item.share-hide{display:none!important}" +
+        ".sb-filters{display:none!important}" +
+        ".share-gate{position:fixed;inset:0;background:rgba(3,8,15,.97);z-index:99999;display:flex;align-items:center;justify-content:center;font-family:'Exo 2',sans-serif}" +
+        ".share-gate-card{background:#0a1422;border:1px solid rgba(0,212,255,.3);border-radius:14px;padding:30px 26px;width:380px;max-width:92vw;box-shadow:0 20px 60px rgba(0,0,0,.5)}" +
+        ".share-gate-h{font-size:22px;font-weight:900;color:#00d4ff;margin-bottom:6px;letter-spacing:-.3px}" +
+        ".share-gate-s{font-size:12px;color:#8aa;margin-bottom:18px;line-height:1.5}" +
+        ".share-gate-inp{width:100%;padding:12px 14px;background:#040810;border:1px solid rgba(0,212,255,.25);border-radius:9px;color:#cfe;font-size:14px;font-family:inherit;margin-bottom:12px;box-sizing:border-box}" +
+        ".share-gate-btn{width:100%;padding:12px;background:linear-gradient(135deg,#00d4ff,#005aaa);border:0;border-radius:9px;color:#001020;font-weight:800;font-size:14px;cursor:pointer;font-family:inherit}" +
+        ".share-gate-err{color:#ff6b6b;font-size:12px;margin-top:10px;min-height:16px}" +
+        ".share-banner{position:fixed;top:0;left:0;right:0;background:linear-gradient(135deg,rgba(0,212,255,.18),rgba(192,132,252,.18));border-bottom:1px solid rgba(0,212,255,.3);padding:6px 14px;font-size:11px;color:#00d4aa;z-index:5000;text-align:center;font-family:'Exo 2',sans-serif;letter-spacing:.5px;font-weight:700}" +
+        "body.share-mode .tb{margin-top:24px}";
+      document.head.appendChild(st);
+
+      var gate = document.createElement("div");
+      gate.className = "share-gate";
+      gate.innerHTML =
+        '<div class="share-gate-card">' +
+          '<div class="share-gate-h">🔒 Shared Device</div>' +
+          '<div class="share-gate-s">Enter the password provided by the owner to unlock this shared device.</div>' +
+          '<div style="position:relative;display:flex">' +
+            '<input type="password" class="share-gate-inp" id="shareGateInp" placeholder="Password" autofocus style="padding-right:40px"/>' +
+            '<button type="button" class="sh-eye" data-target="shareGateInp" style="position:absolute;right:8px;top:10px;background:transparent;border:0;color:#8aa;cursor:pointer;font-size:18px;padding:4px 8px">👁</button>' +
+          '</div>' +
+          '<button class="share-gate-btn" id="shareGateBtn">Unlock</button>' +
+          '<div class="share-gate-err" id="shareGateErr"></div>' +
+          '<div style="font-size:10px;color:#566;margin-top:14px;text-align:center;line-height:1.5">🔐 End-to-end encrypted • PBKDF2-SHA256 200k • AES-GCM-256<br>Wrong attempts are slow by design.</div>' +
+        '</div>';
+
+      /* eye toggle (works in viewer too) */
+      gate.addEventListener("click", function (e) {
+        var t = e.target;
+        if (t && t.classList && t.classList.contains("sh-eye")) {
+          var inp = document.getElementById(t.getAttribute("data-target"));
+          if (!inp) return;
+          if (inp.type === "password") { inp.type = "text"; t.textContent = "🙈"; }
+          else { inp.type = "password"; t.textContent = "👁"; }
+        }
+      });
+      document.body.appendChild(gate);
+
+      function attempt() {
+        var pw  = document.getElementById("shareGateInp").value;
+        var err = document.getElementById("shareGateErr");
+        var btn = document.getElementById("shareGateBtn");
+        err.textContent = "";
+        if (!pw) { err.textContent = "Enter the password."; return; }
+        btn.disabled = true; btn.textContent = "Unlocking…";
+        decryptShare(shareToken, pw).then(function (payload) {
+          shareData = payload;
+          if (!shareData || !shareData.u || !shareData.s) throw new Error("malformed");
+          var url = shareData.u.replace(/\/+$/, "") + "/" + SHARE_NS + "/" + encodeURIComponent(shareData.s) + ".json";
+          return fetch(url, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (rec) {
+            return { url: url, rec: rec };
+          });
+        }).then(function (ctx) {
+          var rec = ctx.rec, url = ctx.url;
+          function reEnable() { btn.disabled = false; btn.textContent = "Unlock"; }
+          if (!rec) { err.textContent = "Share not found or deleted."; reEnable(); return; }
+          if (rec.revoked) { err.textContent = "Access has been revoked by the owner."; reEnable(); return; }
+          if (rec.expiresAt && Date.now() > rec.expiresAt) { err.textContent = "This share link has expired."; reEnable(); return; }
+          if (rec.maxViews && (rec.viewCount || 0) >= rec.maxViews) { err.textContent = "This share has reached its usage limit."; reEnable(); return; }
+
+          /* increment view counter (best-effort, race-tolerant) */
+          fetch(url.replace(/\.json$/, "/viewCount.json"), { method: "PUT", body: JSON.stringify((rec.viewCount || 0) + 1) }).catch(function () {});
+          fetch(url.replace(/\.json$/, "/lastAccessAt.json"), { method: "PUT", body: JSON.stringify(Date.now()) }).catch(function () {});
+
+          gate.remove();
+          document.body.classList.add("share-mode");
+          var banner = document.createElement("div");
+          banner.className = "share-banner";
+          banner.textContent = "🔗 Read-only shared view: " + shareData.d + (rec.label ? " • " + rec.label : "");
+          document.body.appendChild(banner);
+          window._shareRecUrl = url;
+
+          var fb = document.getElementById("fbUrl");
+          if (fb) {
+            fb.value = shareData.u;
+            if (typeof window.connect === "function") { try { window.connect(); } catch (e) {} }
+            else { var btn = document.querySelector("#setup .cta"); if (btn) btn.click(); }
+          }
+
+          var target = String(shareData.d || "").trim();
+          var hasSelected = false;
+
+          function applyFilter() {
+            var items = document.querySelectorAll(".dev-item");
+            var match = null;
+            for (var i = 0; i < items.length; i++) {
+              var dn = items[i].querySelector(".dev-n");
+              var di = items[i].querySelector(".dev-i");
+              var nameTxt = dn ? dn.textContent.trim() : "";
+              var idTxt   = di ? di.textContent.trim() : "";
+              if (nameTxt === target || idTxt === target) {
+                items[i].classList.remove("share-hide");
+                match = items[i];
+              } else {
+                items[i].classList.add("share-hide");
+              }
+            }
+            /* hide section headers that have no visible items underneath */
+            document.querySelectorAll(".sb-list .ldwrap, .sb-list [class*='section'], .sb-list [class*='hdr']").forEach(function (h) {
+              h.style.display = "none";
+            });
+            if (match && !hasSelected) {
+              try { match.click(); hasSelected = true; } catch (e) {}
+            }
+          }
+
+          var sbList = document.getElementById("sbList") || document.querySelector(".sb-list");
+          if (sbList) {
+            var mo = new MutationObserver(function () { applyFilter(); });
+            mo.observe(sbList, { childList: true, subtree: true });
+          }
+          var tries = 0;
+          var iv = setInterval(function () {
+            tries++;
+            applyFilter();
+            if (hasSelected && tries > 6) clearInterval(iv);
+            if (tries > 80) clearInterval(iv);
+          }, 400);
+
+          /* hide the search bar entirely — viewer doesn't need it */
+          var sbSearch = document.querySelector(".sb-search");
+          if (sbSearch) sbSearch.style.display = "none";
+
+          setInterval(function () {
+            fetch(window._shareRecUrl, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (rec) {
+              if (!rec || rec.revoked) {
+                document.body.innerHTML =
+                  '<div style="font-family:Exo 2,sans-serif;color:#ff6b6b;display:flex;align-items:center;justify-content:center;height:100vh;font-size:18px;text-align:center;padding:24px;background:#03070d">' +
+                  "🚫 Access to this share has been revoked.</div>";
+              }
+            }).catch(function () {});
+          }, 30000);
+        }).catch(function (e) {
+          var msg = (e && e.name === "OperationError") ? "Incorrect password." :
+                    (e && e.message === "malformed")   ? "Invalid share link." :
+                    "Incorrect password.";
+          err.textContent = msg;
+          btn.disabled = false; btn.textContent = "Unlock";
+        });
+      }
+      document.getElementById("shareGateBtn").addEventListener("click", attempt);
+      document.getElementById("shareGateInp").addEventListener("keydown", function (e) { if (e.key === "Enter") attempt(); });
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", go);
+    else go();
+  }
+
+  /* ─────────────────────────────────────────────────────────
+     ADMIN MODE — Share tab + create/list/revoke
+     ───────────────────────────────────────────────────────── */
+  function initAdmin() {
+    var tabs = document.querySelector(".tabs");
+    var tabBody = document.querySelector(".tab-body");
+    if (!tabs || !tabBody) return;
+
+    /* tag the existing tabs with their pane name so viewer-mode CSS can hide them */
+    tabs.querySelectorAll(".tab").forEach(function (t) {
+      var oc = t.getAttribute("onclick") || "";
+      var m = oc.match(/switchTab\(['"]([^'"]+)['"]\)/);
+      if (m) t.setAttribute("data-tabname", m[1]);
+    });
+
+    if (!document.getElementById("shareTab")) {
+      var tab = document.createElement("div");
+      tab.className = "tab";
+      tab.id = "shareTab";
+      tab.setAttribute("data-tabname", "sharing");
+      tab.setAttribute("onclick", "switchTab('sharing');if(typeof shareRender==='function')shareRender()");
+      tab.innerHTML = "🔗 Share";
+      tabs.appendChild(tab);
+    }
+
+    if (!document.getElementById("pane-sharing")) {
+      var pane = document.createElement("div");
+      pane.className = "pane";
+      pane.id = "pane-sharing";
+      pane.innerHTML =
+        "<style>" +
+          ".sh-wrap{padding:18px;max-width:920px;margin:0 auto}" +
+          ".sh-card{background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.15);border-radius:14px;padding:18px;margin-bottom:16px}" +
+          ".sh-h{font-size:18px;font-weight:900;color:#ffd55a;margin-bottom:6px;letter-spacing:-.3px}" +
+          ".sh-s{font-size:12px;color:#8aa;margin-bottom:14px;line-height:1.5}" +
+          ".sh-row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}" +
+          ".sh-inp{flex:1;min-width:160px;padding:10px 12px;background:#040810;border:1px solid rgba(0,212,255,.2);border-radius:9px;color:#cfe;font-size:13px;font-family:'Exo 2',sans-serif}" +
+          ".sh-inp:read-only{opacity:.8}" +
+          ".sh-btn{padding:10px 18px;background:linear-gradient(135deg,#00d4ff,#005aaa);border:0;border-radius:9px;color:#001020;font-weight:800;font-size:13px;cursor:pointer;font-family:'Exo 2',sans-serif}" +
+          ".sh-btn:disabled{opacity:.5;cursor:not-allowed}" +
+          ".sh-list{display:flex;flex-direction:column;gap:10px}" +
+          ".sh-item{background:#0a1422;border:1px solid rgba(0,212,255,.15);border-radius:11px;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}" +
+          ".sh-item.rev{opacity:.55}" +
+          ".sh-item-info{flex:1;min-width:200px}" +
+          ".sh-item-d{font-size:14px;font-weight:800;color:#ffd55a}" +
+          ".sh-item-u{font-size:11px;color:#8aa;font-family:'Share Tech Mono',monospace;word-break:break-all;margin-top:4px}" +
+          ".sh-mini{padding:6px 12px;background:#040810;border:1px solid rgba(0,212,255,.2);border-radius:7px;color:#cfe;font-size:11px;font-weight:700;cursor:pointer;font-family:'Exo 2',sans-serif}" +
+          ".sh-mini.dng{color:#ff6b6b;border-color:rgba(255,107,107,.3)}" +
+          ".sh-mini.ok{color:#00d4aa;border-color:rgba(0,212,170,.3)}" +
+          ".sh-empty{color:#8aa;font-size:13px;padding:20px;text-align:center}" +
+          ".sh-status{font-size:10px;font-weight:800;padding:4px 9px;border-radius:5px;letter-spacing:1px}" +
+          ".sh-status.act{background:rgba(0,212,170,.15);color:#00d4aa}" +
+          ".sh-status.revb{background:rgba(255,107,107,.15);color:#ff6b6b}" +
+        "</style>" +
+        '<div class="sh-wrap">' +
+          '<div class="sh-card">' +
+            '<div class="sh-h">🔗 Create Share Link</div>' +
+            '<div class="sh-s">Generate a password-protected, read-only link for the device currently selected in the sidebar. The viewer can see messages but cannot send SMS, edit, or delete. You can revoke access anytime.</div>' +
+            '<div class="sh-row"><input class="sh-inp" id="shCurDev" placeholder="Select a device from the sidebar first..." readonly/></div>' +
+            '<div class="sh-row">' +
+              '<input class="sh-inp" id="shLabel" placeholder="Label (optional, e.g. \'For John\')"/>' +
+              '<div class="sh-pwwrap" style="flex:1;min-width:160px;position:relative;display:flex">' +
+                '<input class="sh-inp" id="shPass" type="password" placeholder="Password (min 4 chars)" style="padding-right:38px"/>' +
+                '<button type="button" class="sh-eye" data-target="shPass" title="Show/hide" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:transparent;border:0;color:#8aa;cursor:pointer;font-size:16px;padding:4px 8px">👁</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="sh-row">' +
+              '<input class="sh-inp" id="shExpire" type="datetime-local" title="Optional: auto-expire at this date/time"/>' +
+              '<input class="sh-inp" id="shMaxViews" type="number" min="1" placeholder="Max uses (optional)" title="Optional: lock after N successful unlocks" style="max-width:160px"/>' +
+              '<button class="sh-btn" id="shCreateBtn">Generate Link</button>' +
+            '</div>' +
+            '<div id="shStrength" style="font-size:11px;color:#8aa;margin-top:-4px;margin-bottom:6px;min-height:14px"></div>' +
+            '<div id="shResult"></div>' +
+          '</div>' +
+          '<div class="sh-card">' +
+            '<div class="sh-h">📜 Active Shares</div>' +
+            '<div class="sh-s">Stored in Firebase under <code style="color:#00d4ff">/' + SHARE_NS + '</code>. Revoking takes effect immediately for any open viewer (within ~30s).</div>' +
+            '<div class="sh-list" id="shList"><div class="sh-empty">Connect to Firebase to load shares…</div></div>' +
+          '</div>' +
+        '</div>';
+      tabBody.appendChild(pane);
+    }
+
+    var btn = document.getElementById("shCreateBtn");
+    if (btn) btn.addEventListener("click", shCreate);
+
+    /* show/hide password eye toggle (event delegation, works for new buttons too) */
+    document.body.addEventListener("click", function (e) {
+      var t = e.target;
+      if (t && t.classList && t.classList.contains("sh-eye")) {
+        var id = t.getAttribute("data-target");
+        var inp = id && document.getElementById(id);
+        if (!inp) return;
+        if (inp.type === "password") { inp.type = "text"; t.textContent = "🙈"; }
+        else { inp.type = "password"; t.textContent = "👁"; }
+      }
+    });
+
+    /* live password-strength hint */
+    var pwInp = document.getElementById("shPass");
+    var strEl = document.getElementById("shStrength");
+    if (pwInp && strEl) pwInp.addEventListener("input", function () {
+      var v = pwInp.value || "";
+      if (!v) { strEl.textContent = ""; return; }
+      var score = 0;
+      if (v.length >= 8) score++;
+      if (v.length >= 12) score++;
+      if (/[A-Z]/.test(v) && /[a-z]/.test(v)) score++;
+      if (/\d/.test(v)) score++;
+      if (/[^A-Za-z0-9]/.test(v)) score++;
+      var labels = ["very weak", "weak", "okay", "good", "strong", "very strong"];
+      var colors = ["#ff6b6b", "#ff9d6b", "#ffd55a", "#a4e463", "#00d4aa", "#00d4ff"];
+      strEl.innerHTML = '<span style="color:' + colors[score] + ';font-weight:700">● ' + labels[score] + '</span>' +
+        ' <span style="color:#566">— anyone with the link can offline-brute-force, so prefer 12+ chars with mixed types</span>';
+    });
+
+    setInterval(function () {
+      var p = document.getElementById("pane-sharing");
+      if (p && p.classList.contains("active")) shareRender();
+    }, 5000);
+
+    window.shareRender = shareRender;
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return "";
+    var d = Date.now() - ts;
+    if (d < 0) {
+      var f = -d;
+      if (f < 60000) return "in " + Math.round(f / 1000) + "s";
+      if (f < 3600000) return "in " + Math.round(f / 60000) + "m";
+      if (f < 86400000) return "in " + Math.round(f / 3600000) + "h";
+      return "in " + Math.round(f / 86400000) + "d";
+    }
+    if (d < 60000) return Math.round(d / 1000) + "s ago";
+    if (d < 3600000) return Math.round(d / 60000) + "m ago";
+    if (d < 86400000) return Math.round(d / 3600000) + "h ago";
+    return Math.round(d / 86400000) + "d ago";
+  }
+
+  function shareRender() {
+    var inp = document.getElementById("shCurDev");
+    if (inp) inp.value = curDevId() || "";
+    refreshList();
+  }
+
+  function refreshList() {
+    var fbUrl = getFbUrl();
+    var list = document.getElementById("shList");
+    if (!list) return;
+    if (!fbUrl) { list.innerHTML = '<div class="sh-empty">Connect to Firebase first.</div>'; return; }
+    fetch(fbUrl + "/" + SHARE_NS + ".json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {
+      data = data || {};
+      var ids = Object.keys(data);
+      if (!ids.length) { list.innerHTML = '<div class="sh-empty">No shares yet. Select a device and create one above.</div>'; return; }
+      ids.sort(function (a, b) { return (data[b].createdAt || 0) - (data[a].createdAt || 0); });
+      var html = "";
+      ids.forEach(function (sid) {
+        var rec = data[sid] || {};
+        var token = rec.token || "";
+        var url = token ? (window.location.origin + window.location.pathname + "?s=" + token) : "(legacy share — recreate to get a new link)";
+        var revoked = !!rec.revoked;
+        var expired = rec.expiresAt && Date.now() > rec.expiresAt;
+        var burnt = rec.maxViews && (rec.viewCount || 0) >= rec.maxViews;
+        var status = revoked ? "REVOKED" : expired ? "EXPIRED" : burnt ? "USED UP" : "ACTIVE";
+        var statusCls = (revoked || expired || burnt) ? "revb" : "act";
+        var meta = [];
+        meta.push("created " + timeAgo(rec.createdAt));
+        if (rec.expiresAt) meta.push((expired ? "expired " : "expires ") + timeAgo(rec.expiresAt));
+        if (rec.maxViews) meta.push("uses " + (rec.viewCount || 0) + "/" + rec.maxViews);
+        else if (rec.viewCount) meta.push(rec.viewCount + " unlocks");
+        html += '<div class="sh-item' + ((revoked || expired || burnt) ? " rev" : "") + '">' +
+          '<div class="sh-item-info">' +
+            '<div class="sh-item-d">📱 ' + escHtml(rec.deviceId) + (rec.label ? ' <span style="color:#8aa;font-weight:600;font-size:12px"> — ' + escHtml(rec.label) + '</span>' : "") + '</div>' +
+            '<div class="sh-item-u">' + escHtml(url) + '</div>' +
+            '<div style="font-size:10px;color:#566;margin-top:4px;font-family:\'Exo 2\',sans-serif">' + escHtml(meta.join(" • ")) + '</div>' +
+          '</div>' +
+          '<div class="sh-status ' + statusCls + '">' + status + '</div>' +
+          (token ? '<button class="sh-mini" data-act="copy" data-url="' + escHtml(url) + '">Copy</button>' : '') +
+          '<button class="sh-mini ' + (revoked ? "ok" : "dng") + '" data-act="' + (revoked ? "unrevoke" : "revoke") + '" data-sid="' + escHtml(sid) + '">' + (revoked ? "Restore" : "Revoke") + '</button>' +
+          '<button class="sh-mini dng" data-act="delete" data-sid="' + escHtml(sid) + '">🗑</button>' +
+        '</div>';
+      });
+      list.innerHTML = html;
+      list.querySelectorAll("button").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var a = b.getAttribute("data-act");
+          if (a === "copy") {
+            try { navigator.clipboard.writeText(b.getAttribute("data-url")); } catch (e) {}
+            var orig = b.textContent; b.textContent = "✓ Copied"; setTimeout(function () { b.textContent = orig; }, 1500);
+          } else if (a === "revoke" || a === "unrevoke") {
+            var sid = b.getAttribute("data-sid");
+            if (a === "revoke" && !confirm("Revoke this share? Anyone using the link will be locked out within ~30 seconds. You can restore it later.")) return;
+            fetch(fbUrl + "/" + SHARE_NS + "/" + sid + "/revoked.json", { method: "PUT", body: JSON.stringify(a === "revoke") })
+              .then(refreshList);
+          } else if (a === "delete") {
+            if (!confirm("Delete this share permanently? The link will stop working.")) return;
+            var sid = b.getAttribute("data-sid");
+            fetch(fbUrl + "/" + SHARE_NS + "/" + sid + ".json", { method: "DELETE" }).then(refreshList);
+          }
+        });
+      });
+    }).catch(function (e) { list.innerHTML = '<div class="sh-empty">Error loading shares: ' + escHtml(e.message) + '</div>'; });
+  }
+
+  async function shCreate() {
+    var btn = document.getElementById("shCreateBtn");
+    var resEl = document.getElementById("shResult");
+    var deviceId = (document.getElementById("shCurDev").value || "").trim();
+    var label = (document.getElementById("shLabel").value || "").trim();
+    var pw = (document.getElementById("shPass").value || "").trim();
+    var fbUrl = getFbUrl();
+    resEl.innerHTML = "";
+    function fail(m) { resEl.innerHTML = '<div style="color:#ff6b6b;font-size:12px;margin-top:8px">' + escHtml(m) + '</div>'; }
+    if (!fbUrl) return fail("Connect to Firebase first.");
+    if (!deviceId) return fail("Select a device from the sidebar first.");
+    if (!pw || pw.length < 4) return fail("Password must be at least 4 characters.");
+    var expireRaw = (document.getElementById("shExpire").value || "").trim();
+    var maxViewsRaw = (document.getElementById("shMaxViews").value || "").trim();
+    var expiresAt = expireRaw ? new Date(expireRaw).getTime() : 0;
+    var maxViews = maxViewsRaw ? Math.max(1, parseInt(maxViewsRaw, 10) | 0) : 0;
+    if (expiresAt && expiresAt < Date.now()) return fail("Expiration must be in the future.");
+
+    btn.disabled = true; btn.textContent = "Generating…";
+    try {
+      var sid = randId(9);
+      var token = await encryptShare({ u: fbUrl, d: deviceId, s: sid }, pw);
+      var rec = { fbUrl: fbUrl, deviceId: deviceId, label: label, token: token, revoked: false, createdAt: Date.now(), viewCount: 0 };
+      if (expiresAt) rec.expiresAt = expiresAt;
+      if (maxViews) rec.maxViews = maxViews;
+      var r = await fetch(fbUrl + "/" + SHARE_NS + "/" + sid + ".json", { method: "PUT", body: JSON.stringify(rec) });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      var url = window.location.origin + window.location.pathname + "?s=" + token;
+      resEl.innerHTML =
+        '<div style="background:rgba(0,212,170,.08);border:1px solid rgba(0,212,170,.3);border-radius:9px;padding:12px;margin-top:10px">' +
+          '<div style="font-size:12px;color:#00d4aa;font-weight:800;margin-bottom:6px">✅ Share link created</div>' +
+          '<div style="font-family:\'Share Tech Mono\',monospace;font-size:11px;color:#cfe;word-break:break-all;margin-bottom:8px">' + escHtml(url) + '</div>' +
+          '<button class="sh-mini ok" id="shCopyNew">Copy Link</button>' +
+        '</div>';
+      var cn = document.getElementById("shCopyNew");
+      cn.addEventListener("click", function () {
+        try { navigator.clipboard.writeText(url); } catch (e) {}
+        cn.textContent = "✓ Copied"; setTimeout(function () { cn.textContent = "Copy Link"; }, 1500);
+      });
+      document.getElementById("shPass").value = "";
+      document.getElementById("shLabel").value = "";
+      document.getElementById("shExpire").value = "";
+      document.getElementById("shMaxViews").value = "";
+      var strEl = document.getElementById("shStrength"); if (strEl) strEl.textContent = "";
+      refreshList();
+    } catch (e) {
+      fail("Error: " + e.message);
+    }
+    btn.disabled = false; btn.textContent = "Generate Link";
+  }
+})();
+</script>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   MEDLINE UI ENHANCE — Tier 1-4 polish, additive only.
+   All overrides via CSS + injected DOM. Never touches the core app.
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  if (window.__medUiInit) return; window.__medUiInit = true;
+
+  var LS = {
+    theme:   "med_ui_theme",
+    density: "med_ui_density",
+    sbW:     "med_ui_sbw",
+    sbCol:   "med_ui_sbcol",
+    pinned:  "med_ui_pinned",
+    smartBadges: "med_ui_smart"
+  };
+  function lsGet(k, d) { try { var v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function lsArr(k)    { try { return JSON.parse(localStorage.getItem(k) || "[]") || []; } catch (e) { return []; } }
+  function lsArrSet(k, a) { lsSet(k, JSON.stringify(a)); }
+
+  function isViewer() { return document.body.classList.contains("share-mode"); }
+  function $(s, r) { return (r || document).querySelector(s); }
+  function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
+  function on(el, ev, fn) { if (el) el.addEventListener(ev, fn); }
+  function ce(t, c, h) { var e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; }
+  function escH(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+
+  injectCSS();
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+
+  function boot() {
+    setTimeout(function () {
+      applyTheme();
+      applyDensity();
+      applySbWidth();
+      applySbCollapsed();
+      mountSettingsBtn();
+      mountPalette();
+      mountShortcutsHelp();
+      mountSbResize();
+      mountSbCollapseBtn();
+      initShiftMultiSelect();
+      initTickers();
+      initLiveAgo();
+      initSmartMessages();
+      initQuickReply();
+      initMsgHoverActions();
+      initActivityTicker();
+      initSettingsState();
+    }, 700);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     CSS — visual polish, theme variants, density, components
+     ───────────────────────────────────────────────────────────── */
+  function injectCSS() {
+    var css = `
+    /* ── deep background atmosphere ─────────────────────── */
+    body {
+      background:
+        radial-gradient(ellipse 80% 60% at 12% -10%, rgba(0,212,255,.05), transparent 50%),
+        radial-gradient(ellipse 70% 60% at 90% 110%, rgba(192,132,252,.05), transparent 50%),
+        radial-gradient(ellipse 50% 40% at 60% 50%, rgba(0,212,170,.025), transparent 60%),
+        #03070d !important;
+    }
+    body::before {
+      content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+      background-image: radial-gradient(rgba(255,255,255,.012) 1px, transparent 1px);
+      background-size: 24px 24px; opacity:.6;
+    }
+    .panel, #panel, .body, .main { position:relative; z-index:1; }
+
+    /* ── glassmorphism on stat & action cards ────────────── */
+    .sc, .nuke-card, .sw .sc2, .ov-banner, .sh-card, .fwd-card {
+      backdrop-filter: blur(18px) saturate(160%);
+      -webkit-backdrop-filter: blur(18px) saturate(160%);
+      background: rgba(10,20,34,.55) !important;
+      border: 1px solid rgba(0,212,255,.13) !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.04);
+      transition: transform .3s cubic-bezier(.2,.8,.2,1), box-shadow .3s, border-color .3s;
+    }
+    .sc:hover, .fwd-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 14px 44px rgba(0,212,255,.15);
+      border-color: rgba(0,212,255,.3) !important;
+    }
+
+    /* ── tabs: sliding underline ─────────────────────────── */
+    .tabs { position: relative; }
+    .tab { transition: color .2s, background .2s, transform .2s; position: relative; }
+    .tab:hover { background: rgba(0,212,255,.04); }
+    .tab.active::after {
+      content: ""; position: absolute; left: 12%; right: 12%; bottom: -1px; height: 2px;
+      background: linear-gradient(90deg, #00d4ff, #c084fc);
+      border-radius: 2px;
+      box-shadow: 0 0 12px rgba(0,212,255,.6), 0 0 24px rgba(192,132,252,.3);
+      animation: med-tab-in .3s cubic-bezier(.2,.8,.2,1);
+    }
+    @keyframes med-tab-in { from { transform: scaleX(.3); opacity:0; } to { transform: scaleX(1); opacity:1; } }
+
+    /* ── sidebar device items: pulse + hover ─────────────── */
+    .dev-item {
+      transition: all .25s cubic-bezier(.2,.8,.2,1);
+      border-radius: 10px;
+      margin: 2px 4px;
+      position: relative;
+      overflow: hidden;
+    }
+    .dev-item::before {
+      content:""; position:absolute; left:0; top:0; bottom:0; width:0;
+      background: linear-gradient(180deg, #00d4ff, #c084fc);
+      transition: width .2s;
+    }
+    .dev-item:hover { background: rgba(0,212,255,.06); transform: translateX(2px); }
+    .dev-item:hover::before { width:3px; }
+    .dev-item.sel {
+      background: linear-gradient(135deg, rgba(0,212,255,.12), rgba(192,132,252,.06)) !important;
+      box-shadow: inset 0 0 0 1px rgba(0,212,255,.2);
+    }
+    .dev-item.sel::before { width:3px; box-shadow: 0 0 10px rgba(0,212,255,.6); }
+    .dev-item.med-multi-sel { background: rgba(192,132,252,.12) !important; }
+    .dev-item.med-multi-sel::after {
+      content:"✓"; position:absolute; right:8px; top:50%; transform: translateY(-50%);
+      width:18px; height:18px; border-radius:50%; background:#c084fc; color:#000;
+      display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900;
+    }
+
+    /* ── scrollbars ──────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: rgba(0,0,0,.2); }
+    ::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(0,212,255,.3), rgba(192,132,252,.3)); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, rgba(0,212,255,.5), rgba(192,132,252,.5)); }
+    * { scrollbar-width: thin; scrollbar-color: rgba(0,212,255,.3) rgba(0,0,0,.2); }
+
+    /* ── message bubbles polish ──────────────────────────── */
+    .msg-list > * {
+      transition: transform .15s, box-shadow .15s;
+    }
+    .msg-list > *:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 16px rgba(0,212,255,.08);
+    }
+
+    /* ── toolbar pill counters animation ─────────────────── */
+    .pill { transition: transform .2s, box-shadow .2s; }
+    .pill:hover { transform: translateY(-1px); }
+
+    /* ── modal backdrop blur ─────────────────────────────── */
+    .mb, .modal-bg, [id*="Modal"] > div:first-child,
+    .mod-bg, [class*="-bg"] {
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+
+    /* ── density variants ────────────────────────────────── */
+    body.med-d-compact .dev-item { padding: 6px 10px !important; }
+    body.med-d-compact .tab { padding: 7px 11px !important; font-size: 11px !important; }
+    body.med-d-compact .tb { padding: 6px 12px !important; }
+    body.med-d-compact .pill { padding: 3px 9px !important; font-size: 10px !important; }
+    body.med-d-spacious .dev-item { padding: 14px 14px !important; }
+    body.med-d-spacious .tab { padding: 14px 18px !important; font-size: 13px !important; }
+    body.med-d-spacious .pill { padding: 8px 14px !important; }
+
+    /* ── theme variants ──────────────────────────────────── */
+    body.med-t-matrix {
+      --gold: #00ff7a !important; --gold2: #00ff7a !important; --mint: #00ff7a !important;
+      --lilac: #00aa55 !important;
+    }
+    body.med-t-matrix .gold-grad, body.med-t-matrix .gold-word, body.med-t-matrix .tb-gl {
+      background: linear-gradient(90deg, #00ff7a, #00aa55) !important;
+      -webkit-background-clip: text !important; background-clip: text !important;
+      -webkit-text-fill-color: transparent !important; color: transparent !important;
+    }
+    body.med-t-matrix .tab.active::after { background: linear-gradient(90deg, #00ff7a, #00aa55) !important; }
+
+    body.med-t-sunset {
+      --gold: #ffb86b !important; --gold2: #ff7e5f !important; --mint: #ff9966 !important;
+      --lilac: #ff6b9d !important;
+    }
+    body.med-t-sunset .gold-grad, body.med-t-sunset .gold-word, body.med-t-sunset .tb-gl {
+      background: linear-gradient(90deg, #ff7e5f, #ff6b9d) !important;
+      -webkit-background-clip: text !important; background-clip: text !important;
+      -webkit-text-fill-color: transparent !important; color: transparent !important;
+    }
+    body.med-t-sunset .tab.active::after { background: linear-gradient(90deg, #ff7e5f, #ff6b9d) !important; }
+
+    body.med-t-minimal {
+      --gold: #e8e8e8 !important; --gold2: #ffffff !important; --mint: #aaffcc !important;
+      --lilac: #cccccc !important;
+    }
+    body.med-t-minimal .gold-grad, body.med-t-minimal .gold-word, body.med-t-minimal .tb-gl {
+      background: none !important; color: #ffffff !important;
+      -webkit-text-fill-color: #ffffff !important;
+    }
+
+    /* ── settings cog button (toolbar) ───────────────────── */
+    .med-cog {
+      background: transparent; border: 1px solid rgba(0,212,255,.18);
+      border-radius: 8px; padding: 6px 10px; color: #cfe; font-size: 14px;
+      cursor: pointer; font-family: 'Exo 2', sans-serif; transition: all .2s;
+      margin-left: 6px;
+    }
+    .med-cog:hover { background: rgba(0,212,255,.08); border-color: rgba(0,212,255,.35); }
+
+    /* ── settings panel ──────────────────────────────────── */
+    .med-set-back {
+      position: fixed; inset: 0; background: rgba(0,0,0,.65);
+      backdrop-filter: blur(10px); z-index: 99996;
+      display: flex; align-items: center; justify-content: center;
+      animation: med-fade-in .2s ease-out;
+    }
+    @keyframes med-fade-in { from { opacity:0; } to { opacity:1; } }
+    .med-set {
+      width: 480px; max-width: 92vw; background: #0a1422;
+      border: 1px solid rgba(0,212,255,.25); border-radius: 16px;
+      box-shadow: 0 25px 80px rgba(0,0,0,.6); overflow: hidden;
+      animation: med-pop-in .25s cubic-bezier(.2,.8,.2,1);
+    }
+    @keyframes med-pop-in { from { transform: scale(.92); opacity:0; } to { transform: scale(1); opacity:1; } }
+    .med-set-h {
+      padding: 18px 22px; border-bottom: 1px solid rgba(0,212,255,.15);
+      font-size: 18px; font-weight: 900; color: #00d4ff; letter-spacing: -.3px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .med-set-body { padding: 20px 22px; max-height: 70vh; overflow-y: auto; }
+    .med-set-row { margin-bottom: 18px; }
+    .med-set-lbl {
+      font-size: 11px; font-weight: 800; color: #8aa; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 8px;
+    }
+    .med-set-opts { display: flex; gap: 8px; flex-wrap: wrap; }
+    .med-set-opt {
+      padding: 9px 14px; background: #040810;
+      border: 1px solid rgba(0,212,255,.2); border-radius: 8px;
+      color: #cfe; font-size: 12px; font-weight: 700; cursor: pointer;
+      font-family: 'Exo 2', sans-serif; transition: all .2s;
+    }
+    .med-set-opt:hover { border-color: rgba(0,212,255,.4); transform: translateY(-1px); }
+    .med-set-opt.act {
+      background: linear-gradient(135deg, rgba(0,212,255,.15), rgba(192,132,252,.08));
+      border-color: rgba(0,212,255,.5); color: #00d4ff;
+    }
+    .med-set-toggle {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; background: #040810;
+      border: 1px solid rgba(0,212,255,.15); border-radius: 9px;
+      cursor: pointer; transition: all .2s;
+    }
+    .med-set-toggle:hover { border-color: rgba(0,212,255,.3); }
+    .med-set-tname { flex: 1; font-size: 13px; color: #cfe; font-weight: 600; }
+    .med-set-tdesc { font-size: 11px; color: #678; margin-top: 2px; }
+    .med-sw {
+      width: 36px; height: 20px; background: #1a2638; border-radius: 10px;
+      position: relative; transition: background .2s; flex-shrink: 0;
+    }
+    .med-sw::after {
+      content: ""; width: 16px; height: 16px; background: #cfe;
+      border-radius: 50%; position: absolute; top: 2px; left: 2px;
+      transition: left .2s, background .2s;
+    }
+    .med-sw.on { background: linear-gradient(135deg, #00d4ff, #005aaa); }
+    .med-sw.on::after { left: 18px; background: #fff; }
+
+    /* ── command palette ─────────────────────────────────── */
+    .cmdk-back {
+      position: fixed; inset: 0; background: rgba(0,0,0,.65);
+      backdrop-filter: blur(10px); z-index: 99997;
+      display: flex; align-items: flex-start; justify-content: center;
+      padding-top: 14vh; animation: med-fade-in .15s ease-out;
+    }
+    .cmdk {
+      width: 620px; max-width: 92vw; background: #0a1422;
+      border: 1px solid rgba(0,212,255,.25); border-radius: 14px;
+      box-shadow: 0 25px 80px rgba(0,0,0,.6); overflow: hidden;
+      animation: med-pop-in .2s cubic-bezier(.2,.8,.2,1);
+    }
+    .cmdk-inp {
+      width: 100%; padding: 18px 22px; background: transparent;
+      border: 0; border-bottom: 1px solid rgba(0,212,255,.15);
+      color: #cfe; font-size: 16px; font-family: inherit; outline: none;
+      box-sizing: border-box;
+    }
+    .cmdk-inp::placeholder { color: #566; }
+    .cmdk-list { max-height: 50vh; overflow-y: auto; padding: 6px; }
+    .cmdk-grp {
+      font-size: 10px; font-weight: 800; color: #566; text-transform: uppercase;
+      letter-spacing: 1.5px; padding: 10px 14px 6px;
+    }
+    .cmdk-item {
+      padding: 10px 14px; border-radius: 8px; cursor: pointer;
+      display: flex; align-items: center; gap: 12px;
+      color: #cfe; font-size: 13px; transition: background .12s;
+    }
+    .cmdk-item.sel { background: rgba(0,212,255,.12); }
+    .cmdk-item-icon { width: 22px; text-align: center; flex-shrink: 0; }
+    .cmdk-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cmdk-item-meta { color: #566; font-size: 11px; }
+    .cmdk-empty { padding: 28px; text-align: center; color: #566; font-size: 13px; }
+    .cmdk-foot {
+      padding: 10px 14px; border-top: 1px solid rgba(0,212,255,.1);
+      font-size: 10px; color: #566; display: flex; gap: 14px; justify-content: flex-end;
+    }
+    .kbd {
+      display: inline-block; padding: 1px 6px; background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.12); border-radius: 4px;
+      font-family: monospace; font-size: 10px; color: #aab;
+    }
+
+    /* ── shortcuts help overlay ──────────────────────────── */
+    .help-back { position: fixed; inset: 0; background: rgba(0,0,0,.7); backdrop-filter: blur(10px); z-index: 99996; display: flex; align-items: center; justify-content: center; animation: med-fade-in .2s; }
+    .help-card { width: 560px; max-width: 92vw; background: #0a1422; border: 1px solid rgba(0,212,255,.25); border-radius: 14px; padding: 24px 26px; animation: med-pop-in .2s cubic-bezier(.2,.8,.2,1); }
+    .help-h { font-size: 18px; font-weight: 900; color: #00d4ff; margin-bottom: 18px; }
+    .help-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px dashed rgba(0,212,255,.08); font-size: 13px; color: #cfe; }
+    .help-row:last-child { border: 0; }
+    .help-keys { display: flex; gap: 4px; }
+
+    /* ── sidebar resize handle ───────────────────────────── */
+    .med-sb-handle {
+      position: absolute; top: 0; bottom: 0; right: -3px; width: 6px;
+      cursor: col-resize; z-index: 50;
+      background: transparent; transition: background .2s;
+    }
+    .med-sb-handle:hover, .med-sb-handle.drag { background: rgba(0,212,255,.3); }
+    body.med-sb-collapsed .sb { width: 60px !important; min-width: 60px !important; overflow: hidden; }
+    body.med-sb-collapsed .sb .sb-search,
+    body.med-sb-collapsed .sb .sb-filters,
+    body.med-sb-collapsed .sb .sb-footer,
+    body.med-sb-collapsed .sb .sb-brand,
+    body.med-sb-collapsed .sb .dev-n,
+    body.med-sb-collapsed .sb .dev-i,
+    body.med-sb-collapsed .sb .dev-note { display: none !important; }
+    body.med-sb-collapsed .dev-item { padding: 8px 4px !important; text-align: center; }
+    .med-sb-toggle {
+      position: absolute; top: 8px; right: 8px; z-index: 51;
+      width: 26px; height: 26px; border-radius: 6px;
+      background: rgba(0,212,255,.1); border: 1px solid rgba(0,212,255,.25);
+      color: #00d4ff; cursor: pointer; font-size: 12px; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .2s;
+    }
+    .med-sb-toggle:hover { background: rgba(0,212,255,.2); }
+
+    /* ── smart message badges ────────────────────────────── */
+    .med-badge {
+      display: inline-block; padding: 2px 7px; border-radius: 4px;
+      font-size: 9px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;
+      margin-right: 6px; vertical-align: middle;
+      font-family: 'Exo 2', sans-serif;
+    }
+    .med-badge.otp     { background: rgba(0,212,170,.15); color: #00d4aa; border: 1px solid rgba(0,212,170,.35); }
+    .med-badge.bank    { background: rgba(255,213,90,.15); color: #ffd55a; border: 1px solid rgba(255,213,90,.35); }
+    .med-badge.promo   { background: rgba(192,132,252,.15); color: #c084fc; border: 1px solid rgba(192,132,252,.35); }
+    .med-badge.delivery{ background: rgba(0,212,255,.15);  color: #00d4ff; border: 1px solid rgba(0,212,255,.35); }
+    .med-badge.alert   { background: rgba(255,107,107,.15); color: #ff6b6b; border: 1px solid rgba(255,107,107,.35); }
+    .med-otp-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(0,212,170,.12); border: 1px solid rgba(0,212,170,.4);
+      color: #00d4aa; padding: 3px 10px; border-radius: 14px;
+      font-family: 'Share Tech Mono', monospace; font-weight: 800;
+      font-size: 13px; cursor: pointer; transition: all .15s;
+      margin: 2px 4px 2px 0;
+    }
+    .med-otp-pill:hover { background: rgba(0,212,170,.22); transform: translateY(-1px); }
+    .med-msg-actions {
+      position: absolute; top: 6px; right: 6px;
+      opacity: 0; transition: opacity .15s;
+      display: flex; gap: 4px;
+    }
+    .msg-list > *, .am-row {
+      position: relative;
+    }
+    .msg-list > *:hover .med-msg-actions,
+    .am-row:hover .med-msg-actions { opacity: 1; }
+    .med-msg-act {
+      width: 26px; height: 26px; border-radius: 6px;
+      background: rgba(10,20,34,.85); border: 1px solid rgba(0,212,255,.25);
+      color: #cfe; cursor: pointer; font-size: 12px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .15s;
+    }
+    .med-msg-act:hover { background: rgba(0,212,255,.18); border-color: rgba(0,212,255,.5); }
+
+    /* ── activity ticker (corner) ────────────────────────── */
+    .med-tick {
+      position: fixed; bottom: 18px; right: 18px;
+      max-width: 360px; z-index: 9000;
+      display: flex; flex-direction: column; gap: 8px;
+      pointer-events: none;
+    }
+    .med-tick-card {
+      background: rgba(10,20,34,.95); backdrop-filter: blur(14px);
+      border: 1px solid rgba(0,212,255,.3); border-radius: 11px;
+      padding: 10px 13px; color: #cfe; font-size: 12px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+      animation: med-tick-in .3s cubic-bezier(.2,.8,.2,1);
+      pointer-events: auto;
+    }
+    @keyframes med-tick-in {
+      from { transform: translateX(20px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+    .med-tick-d { font-size: 10px; color: #00d4aa; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 3px; }
+
+    /* ── number tickers ──────────────────────────────────── */
+    .pill { font-variant-numeric: tabular-nums; }
+
+    /* viewer mode: hide settings cog & palette button */
+    body.share-mode .med-cog { display: none !important; }
+    `;
+    var s = document.createElement("style");
+    s.id = "medUiStyle";
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Theme / density / sidebar persistence
+     ───────────────────────────────────────────────────────────── */
+  function applyTheme() {
+    var t = lsGet(LS.theme, "cyber");
+    document.body.classList.remove("med-t-cyber", "med-t-matrix", "med-t-sunset", "med-t-minimal");
+    document.body.classList.add("med-t-" + t);
+  }
+  function setTheme(t) { lsSet(LS.theme, t); applyTheme(); }
+
+  function applyDensity() {
+    var d = lsGet(LS.density, "normal");
+    document.body.classList.remove("med-d-compact", "med-d-normal", "med-d-spacious");
+    document.body.classList.add("med-d-" + d);
+  }
+  function setDensity(d) { lsSet(LS.density, d); applyDensity(); }
+
+  function applySbWidth() {
+    var w = parseInt(lsGet(LS.sbW, "0"), 10);
+    if (w > 200 && w < 600) {
+      var sb = $(".sb"); if (sb) { sb.style.width = w + "px"; sb.style.minWidth = w + "px"; }
+    }
+  }
+  function applySbCollapsed() {
+    if (lsGet(LS.sbCol, "0") === "1") document.body.classList.add("med-sb-collapsed");
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Toolbar: cog + palette button
+     ───────────────────────────────────────────────────────────── */
+  function mountSettingsBtn() {
+    var tb = $(".tb"); if (!tb || isViewer()) return;
+    if ($(".med-cog")) return;
+    var palBtn = ce("button", "med-cog", "⌘K");
+    palBtn.title = "Command palette (Ctrl+K)";
+    on(palBtn, "click", openPalette);
+    var cog = ce("button", "med-cog", "⚙");
+    cog.title = "Settings";
+    on(cog, "click", openSettings);
+    tb.appendChild(palBtn);
+    tb.appendChild(cog);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Settings panel
+     ───────────────────────────────────────────────────────────── */
+  function openSettings() {
+    if ($(".med-set-back")) return;
+    var back = ce("div", "med-set-back");
+    var smartOn = lsGet(LS.smartBadges, "1") === "1";
+    back.innerHTML =
+      '<div class="med-set">' +
+        '<div class="med-set-h">⚙ Settings</div>' +
+        '<div class="med-set-body">' +
+          '<div class="med-set-row">' +
+            '<div class="med-set-lbl">🎨 Theme</div>' +
+            '<div class="med-set-opts" data-group="theme">' +
+              themeOpt("cyber", "Cyber") + themeOpt("matrix", "Matrix") +
+              themeOpt("sunset", "Sunset") + themeOpt("minimal", "Minimal") +
+            '</div>' +
+          '</div>' +
+          '<div class="med-set-row">' +
+            '<div class="med-set-lbl">📐 Density</div>' +
+            '<div class="med-set-opts" data-group="density">' +
+              densityOpt("compact", "Compact") + densityOpt("normal", "Normal") +
+              densityOpt("spacious", "Spacious") +
+            '</div>' +
+          '</div>' +
+          '<div class="med-set-row">' +
+            '<div class="med-set-lbl">✨ Behavior</div>' +
+            '<div class="med-set-toggle" data-tog="smart">' +
+              '<div style="flex:1">' +
+                '<div class="med-set-tname">Smart message badges</div>' +
+                '<div class="med-set-tdesc">Auto-detect OTP / banking / promo / delivery and tag them</div>' +
+              '</div>' +
+              '<div class="med-sw' + (smartOn ? " on" : "") + '"></div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="med-set-row">' +
+            '<div class="med-set-lbl">⌨ Shortcuts</div>' +
+            '<div style="font-size:12px;color:#8aa;line-height:1.7">' +
+              '<span class="kbd">Ctrl/⌘+K</span> command palette &nbsp;·&nbsp; ' +
+              '<span class="kbd">?</span> help &nbsp;·&nbsp; ' +
+              '<span class="kbd">[</span> collapse sidebar &nbsp;·&nbsp; ' +
+              '<span class="kbd">/</span> focus search &nbsp;·&nbsp; ' +
+              '<span class="kbd">Esc</span> close' +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:18px">' +
+            '<button class="med-set-opt" id="medSetClose">Close</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(back);
+
+    function themeOpt(v, l) { var cur = lsGet(LS.theme, "cyber") === v ? " act" : ""; return '<div class="med-set-opt' + cur + '" data-v="' + v + '">' + l + '</div>'; }
+    function densityOpt(v, l) { var cur = lsGet(LS.density, "normal") === v ? " act" : ""; return '<div class="med-set-opt' + cur + '" data-v="' + v + '">' + l + '</div>'; }
+
+    on(back, "click", function (e) { if (e.target === back) close(); });
+    on($("#medSetClose", back), "click", close);
+
+    $$('.med-set-opts', back).forEach(function (g) {
+      var grp = g.getAttribute("data-group");
+      $$('.med-set-opt', g).forEach(function (o) {
+        on(o, "click", function () {
+          $$('.med-set-opt', g).forEach(function (x) { x.classList.remove("act"); });
+          o.classList.add("act");
+          var v = o.getAttribute("data-v");
+          if (grp === "theme") setTheme(v);
+          if (grp === "density") setDensity(v);
+        });
+      });
+    });
+    var togSmart = $('[data-tog="smart"]', back);
+    on(togSmart, "click", function () {
+      var sw = $(".med-sw", togSmart);
+      var on_ = !sw.classList.contains("on");
+      sw.classList.toggle("on", on_);
+      lsSet(LS.smartBadges, on_ ? "1" : "0");
+      runSmartScan();
+    });
+
+    function close() { back.remove(); }
+    on(document, "keydown", escClose);
+    function escClose(e) { if (e.key === "Escape" && document.body.contains(back)) { close(); document.removeEventListener("keydown", escClose); } }
+  }
+
+  function initSettingsState() { /* already applied in boot */ }
+
+  /* ─────────────────────────────────────────────────────────────
+     Command palette ⌘K
+     ───────────────────────────────────────────────────────────── */
+  function openPalette() {
+    if (isViewer()) return;
+    if ($(".cmdk-back")) return;
+    var back = ce("div", "cmdk-back");
+    back.innerHTML =
+      '<div class="cmdk">' +
+        '<input class="cmdk-inp" id="cmdkInp" placeholder="Search devices, tabs, actions…" autocomplete="off"/>' +
+        '<div class="cmdk-list" id="cmdkList"></div>' +
+        '<div class="cmdk-foot"><span><span class="kbd">↑↓</span> navigate</span><span><span class="kbd">↵</span> select</span><span><span class="kbd">esc</span> close</span></div>' +
+      '</div>';
+    document.body.appendChild(back);
+    var inp = $("#cmdkInp", back);
+    var list = $("#cmdkList", back);
+    var sel = 0;
+    var items = buildCmdItems();
+
+    function render(q) {
+      q = (q || "").toLowerCase().trim();
+      var filtered = q ? items.filter(function (it) {
+        var hay = (it.name + " " + (it.meta || "") + " " + it.group).toLowerCase();
+        return hay.indexOf(q) >= 0 || fuzzy(hay, q);
+      }) : items;
+      sel = 0;
+      if (!filtered.length) {
+        list.innerHTML = '<div class="cmdk-empty">No matches.</div>';
+        return;
+      }
+      var groups = {};
+      filtered.forEach(function (it, i) {
+        (groups[it.group] = groups[it.group] || []).push({ it: it, i: i });
+      });
+      var html = "";
+      ["Devices", "Tabs", "Actions"].forEach(function (g) {
+        if (!groups[g]) return;
+        html += '<div class="cmdk-grp">' + g + '</div>';
+        groups[g].forEach(function (e) {
+          html +=
+            '<div class="cmdk-item" data-i="' + e.i + '">' +
+              '<div class="cmdk-item-icon">' + e.it.icon + '</div>' +
+              '<div class="cmdk-item-name">' + escH(e.it.name) + '</div>' +
+              (e.it.meta ? '<div class="cmdk-item-meta">' + escH(e.it.meta) + '</div>' : '') +
+            '</div>';
+        });
+      });
+      list.innerHTML = html;
+      list._items = filtered;
+      updateSel();
+      $$('.cmdk-item', list).forEach(function (el) {
+        on(el, "click", function () { sel = parseInt(el.getAttribute("data-i"), 10); fire(); });
+        on(el, "mouseenter", function () { sel = parseInt(el.getAttribute("data-i"), 10); updateSel(); });
+      });
+    }
+    function updateSel() {
+      var els = $$('.cmdk-item', list);
+      els.forEach(function (e, i) { e.classList.toggle("sel", parseInt(e.getAttribute("data-i"), 10) === sel); });
+      var cur = els.filter(function (e) { return e.classList.contains("sel"); })[0];
+      if (cur) cur.scrollIntoView({ block: "nearest" });
+    }
+    function fire() {
+      var arr = list._items || [];
+      var picked = arr[sel];
+      if (!picked) return;
+      close();
+      try { picked.run(); } catch (e) { console.error(e); }
+    }
+    function close() {
+      back.remove();
+      document.removeEventListener("keydown", kd);
+    }
+    function kd(e) {
+      if (e.key === "Escape") { close(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); var n = (list._items || []).length; sel = (sel + 1) % Math.max(n, 1); updateSel(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); var n = (list._items || []).length; sel = (sel - 1 + Math.max(n, 1)) % Math.max(n, 1); updateSel(); }
+      else if (e.key === "Enter") { e.preventDefault(); fire(); }
+    }
+
+    on(back, "click", function (e) { if (e.target === back) close(); });
+    on(inp, "input", function () { render(inp.value); });
+    document.addEventListener("keydown", kd);
+    render("");
+    setTimeout(function () { inp.focus(); }, 30);
+  }
+
+  function buildCmdItems() {
+    var items = [];
+    /* Devices */
+    $$(".dev-item").forEach(function (it) {
+      var n = $(".dev-n", it); var i = $(".dev-i", it);
+      var name = n ? n.textContent.trim() : "";
+      var id = i ? i.textContent.trim() : "";
+      if (!name && !id) return;
+      items.push({
+        group: "Devices", icon: "📱",
+        name: name || id, meta: id !== name ? id : "",
+        run: function () { it.click(); it.scrollIntoView({ block: "nearest" }); }
+      });
+    });
+    /* Tabs */
+    $$(".tabs .tab").forEach(function (t) {
+      var oc = t.getAttribute("onclick") || "";
+      var m = oc.match(/switchTab\(['"]([^'"]+)['"]\)/);
+      if (!m) return;
+      items.push({
+        group: "Tabs", icon: "📑",
+        name: t.textContent.trim().replace(/^[\W_]+/, ""), meta: m[1],
+        run: function () { t.click(); }
+      });
+    });
+    /* Actions */
+    var acts = [
+      { name: "Refresh devices", icon: "↻", fn: function () { var b = $('.tb-btn[onclick*="loadDevs"]'); b && b.click(); } },
+      { name: "Toggle sidebar", icon: "☰", fn: function () { toggleSb(); } },
+      { name: "Cycle font size", icon: "Aa", fn: function () { var b = $('.tb-btn[onclick*="cycleFont"]'); b && b.click(); } },
+      { name: "Open Bulk", icon: "⚡", fn: function () { var b = $('.tb-btn[onclick*="bulkModal"]'); b && b.click(); } },
+      { name: "Export CSV", icon: "⬇", fn: function () { var b = $('.tb-btn[onclick*="exportAllMsgs"]'); b && b.click(); } },
+      { name: "Auto-PING all", icon: "📡", fn: function () { var b = $('.tb-btn[onclick*="autoPinAll"]'); b && b.click(); } },
+      { name: "Open Settings", icon: "⚙", fn: openSettings },
+      { name: "Show keyboard shortcuts", icon: "⌨", fn: openHelp },
+      { name: "Disconnect Firebase", icon: "✕", fn: function () { if (typeof window.disconnect === "function") window.disconnect(); } }
+    ];
+    acts.forEach(function (a) { items.push({ group: "Actions", icon: a.icon, name: a.name, run: a.fn }); });
+    return items;
+  }
+
+  function fuzzy(hay, q) {
+    var i = 0, j = 0;
+    while (i < hay.length && j < q.length) {
+      if (hay[i] === q[j]) j++;
+      i++;
+    }
+    return j === q.length;
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Keyboard shortcuts + ? help overlay
+     ───────────────────────────────────────────────────────────── */
+  document.addEventListener("keydown", function (e) {
+    if (isInputTarget(e.target) && e.key !== "Escape") {
+      // allow global Ctrl+K even from input
+      if (!((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k")) return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault(); openPalette(); return;
+    }
+    if (e.key === "?" && !e.ctrlKey && !e.metaKey) { openHelp(); }
+    else if (e.key === "[") { toggleSb(); }
+    else if (e.key === "/") { e.preventDefault(); var s = $("#sbSearch"); if (s) s.focus(); }
+    else if (e.key === "Escape") {
+      $$('.cmdk-back, .help-back, .med-set-back').forEach(function (x) { x.remove(); });
+    }
+    else if (/^[1-9]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      var idx = parseInt(e.key, 10) - 1;
+      var tabs = $$(".tabs .tab").filter(function (t) { return t.offsetParent !== null; });
+      if (tabs[idx]) tabs[idx].click();
+    }
+    else if (e.key.toLowerCase() === "j" && !e.ctrlKey && !e.metaKey) { stepDevice(1); }
+    else if (e.key.toLowerCase() === "k" && !e.ctrlKey && !e.metaKey) { stepDevice(-1); }
+  });
+  function isInputTarget(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable); }
+  function stepDevice(d) {
+    var items = $$(".dev-item").filter(function (i) { return !i.classList.contains("share-hide") && i.offsetParent !== null; });
+    if (!items.length) return;
+    var cur = items.indexOf($(".dev-item.sel"));
+    var next = items[(cur + d + items.length) % items.length];
+    if (next) { next.click(); next.scrollIntoView({ block: "nearest" }); }
+  }
+  function toggleSb() {
+    document.body.classList.toggle("med-sb-collapsed");
+    lsSet(LS.sbCol, document.body.classList.contains("med-sb-collapsed") ? "1" : "0");
+  }
+
+  function mountShortcutsHelp() { /* opened via ? key only */ }
+  function openHelp() {
+    if ($(".help-back")) return;
+    var back = ce("div", "help-back");
+    var rows = [
+      ["Command palette", ["Ctrl", "K"]],
+      ["Show this help", ["?"]],
+      ["Focus device search", ["/"]],
+      ["Toggle sidebar", ["["]],
+      ["Next / previous device", ["J", "K"]],
+      ["Switch tabs", ["1", "—", "9"]],
+      ["Close anything", ["Esc"]]
+    ];
+    var rowsHtml = rows.map(function (r) {
+      return '<div class="help-row"><span>' + r[0] + '</span><span class="help-keys">' + r[1].map(function (k) { return '<span class="kbd">' + k + '</span>'; }).join(" ") + '</span></div>';
+    }).join("");
+    back.innerHTML = '<div class="help-card"><div class="help-h">⌨ Keyboard shortcuts</div>' + rowsHtml + '<div style="margin-top:18px;text-align:right"><button class="med-set-opt" id="helpClose">Close</button></div></div>';
+    document.body.appendChild(back);
+    on(back, "click", function (e) { if (e.target === back) back.remove(); });
+    on($("#helpClose", back), "click", function () { back.remove(); });
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Sidebar resize + collapse
+     ───────────────────────────────────────────────────────────── */
+  function mountSbResize() {
+    var sb = $(".sb"); if (!sb) return;
+    if ($(".med-sb-handle", sb)) return;
+    sb.style.position = sb.style.position || "relative";
+    var h = ce("div", "med-sb-handle");
+    sb.appendChild(h);
+    var startX = 0, startW = 0, dragging = false;
+    on(h, "mousedown", function (e) {
+      if (document.body.classList.contains("med-sb-collapsed")) return;
+      dragging = true; h.classList.add("drag");
+      startX = e.clientX; startW = sb.getBoundingClientRect().width;
+      document.body.style.userSelect = "none";
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", function (e) {
+      if (!dragging) return;
+      var w = Math.min(560, Math.max(220, startW + (e.clientX - startX)));
+      sb.style.width = w + "px"; sb.style.minWidth = w + "px";
+    });
+    document.addEventListener("mouseup", function () {
+      if (!dragging) return;
+      dragging = false; h.classList.remove("drag");
+      document.body.style.userSelect = "";
+      lsSet(LS.sbW, parseInt(sb.style.width, 10));
+    });
+  }
+  function mountSbCollapseBtn() {
+    var sb = $(".sb"); if (!sb || $(".med-sb-toggle", sb)) return;
+    var b = ce("button", "med-sb-toggle", "‹");
+    b.title = "Collapse sidebar ([)";
+    on(b, "click", toggleSb);
+    sb.appendChild(b);
+    setInterval(function () { b.textContent = document.body.classList.contains("med-sb-collapsed") ? "›" : "‹"; }, 400);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Multi-select shift-click on devices
+     ───────────────────────────────────────────────────────────── */
+  function initShiftMultiSelect() {
+    document.addEventListener("click", function (e) {
+      if (!e.shiftKey) return;
+      var item = e.target.closest && e.target.closest(".dev-item");
+      if (!item) return;
+      e.preventDefault(); e.stopPropagation();
+      item.classList.toggle("med-multi-sel");
+      flashMultiCount();
+    }, true);
+  }
+  function flashMultiCount() {
+    var n = $$(".dev-item.med-multi-sel").length;
+    if (typeof window.toast === "function") window.toast(n + " device(s) selected (shift-click to add/remove)");
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Animated number tickers on toolbar pills
+     ───────────────────────────────────────────────────────────── */
+  function initTickers() {
+    var ids = ["tpTot", "tpOn", "tpOff", "ov-tot", "ov-on", "ov-off", "ov-upi", "sv-tot", "sv-on", "sv-off", "sv-sim"];
+    ids.forEach(function (id) {
+      var el = document.getElementById(id); if (!el) return;
+      var last = el.textContent.trim();
+      var mo = new MutationObserver(function () {
+        var cur = el.textContent.trim();
+        if (cur === last) return;
+        var fromN = parseInt(last.replace(/[^\d-]/g, ""), 10);
+        var toN = parseInt(cur.replace(/[^\d-]/g, ""), 10);
+        last = cur;
+        if (isFinite(fromN) && isFinite(toN) && fromN !== toN && Math.abs(toN - fromN) < 9999) {
+          animateNum(el, fromN, toN, 600);
+        }
+      });
+      mo.observe(el, { childList: true, characterData: true, subtree: true });
+    });
+  }
+  function animateNum(el, from, to, dur) {
+    var start = performance.now();
+    function step(t) {
+      var p = Math.min(1, (t - start) / dur);
+      var eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = String(Math.round(from + (to - from) * eased));
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Live "ago" timestamps — refresh every 30s
+     ───────────────────────────────────────────────────────────── */
+  function initLiveAgo() {
+    setInterval(function () {
+      $$('[data-med-ts]').forEach(function (el) {
+        var ts = parseInt(el.getAttribute("data-med-ts"), 10);
+        if (isFinite(ts)) el.textContent = ago(ts);
+      });
+    }, 30000);
+  }
+  function ago(ts) {
+    var d = Date.now() - ts;
+    if (d < 60000) return "just now";
+    if (d < 3600000) return Math.round(d / 60000) + "m ago";
+    if (d < 86400000) return Math.round(d / 3600000) + "h ago";
+    return Math.round(d / 86400000) + "d ago";
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Smart message badges + OTP detection + copy
+     ───────────────────────────────────────────────────────────── */
+  var BADGE_RULES = [
+    { cls: "otp",     re: /\b(otp|one[\s-]?time|verification|code|pin)\b/i },
+    { cls: "bank",    re: /\b(credited|debited|balance|a\/c|account|upi|imps|neft|rs\.?|inr|paid|received|txn|transaction)\b/i },
+    { cls: "promo",   re: /\b(off|sale|discount|offer|deal|coupon|cashback|free|win|prize|congratulations)\b/i },
+    { cls: "delivery",re: /\b(delivered|delivery|order|shipped|out for delivery|tracking|courier|arriving)\b/i },
+    { cls: "alert",   re: /\b(alert|warning|urgent|expired|failed|declined|blocked|suspicious)\b/i }
+  ];
+  var OTP_RE = /(?<![\d])(\d{4,8})(?![\d])/g;
+
+  function smartEnabled() { return lsGet(LS.smartBadges, "1") === "1"; }
+
+  function initSmartMessages() {
+    /* Watch both pane-messages and pane-allmsgs for new bubbles */
+    ["msgList", "amList"].forEach(function (id) {
+      var c = document.getElementById(id); if (!c) return;
+      var mo = new MutationObserver(function (muts) {
+        if (!smartEnabled()) return;
+        muts.forEach(function (m) {
+          m.addedNodes.forEach(function (n) {
+            if (n.nodeType === 1) processMsgNode(n);
+          });
+        });
+      });
+      mo.observe(c, { childList: true, subtree: true });
+      /* initial scan */
+      setTimeout(function () { runSmartScan(); }, 1500);
+    });
+  }
+  function runSmartScan() {
+    if (!smartEnabled()) {
+      $$('.med-badge, .med-otp-pill').forEach(function (el) { el.remove(); });
+      return;
+    }
+    $$('#msgList > *, #amList > *').forEach(processMsgNode);
+  }
+  function processMsgNode(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.__medScanned) return;
+    var txtEl = node.querySelector(".msg-txt") || node;
+    var raw = txtEl.textContent || "";
+    if (!raw) return;
+    node.__medScanned = true;
+
+    /* badges */
+    var hits = [];
+    BADGE_RULES.forEach(function (r) { if (r.re.test(raw)) hits.push(r.cls); });
+    if (hits.length) {
+      var badgeBar = ce("div", "", hits.map(function (c) {
+        return '<span class="med-badge ' + c + '">' + c + '</span>';
+      }).join(""));
+      badgeBar.style.cssText = "margin:4px 0 6px";
+      txtEl.parentNode.insertBefore(badgeBar, txtEl);
+    }
+
+    /* OTP pill — only the first 4-8 digit number (avoid phone numbers > 8) */
+    if (hits.indexOf("otp") >= 0) {
+      var m = raw.match(/(?:^|[^\d])(\d{4,8})(?!\d)/);
+      if (m) {
+        var code = m[1];
+        var pill = ce("span", "med-otp-pill", "🔑 " + code + " <span style=\"font-size:9px;opacity:.7\">copy</span>");
+        pill.title = "Click to copy OTP";
+        on(pill, "click", function (e) {
+          e.stopPropagation();
+          try { navigator.clipboard.writeText(code); } catch (err) {}
+          pill.innerHTML = "✓ Copied " + code;
+          setTimeout(function () { pill.innerHTML = "🔑 " + code + " <span style=\"font-size:9px;opacity:.7\">copy</span>"; }, 1400);
+        });
+        var holder = ce("div"); holder.style.cssText = "margin-top:6px";
+        holder.appendChild(pill);
+        txtEl.parentNode.appendChild(holder);
+      }
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Quick reply on message hover (uses sender → fills Send SMS)
+     ───────────────────────────────────────────────────────────── */
+  function initMsgHoverActions() {
+    function decorate(node) {
+      if (node.__medAct) return;
+      var sender = node.querySelector(".msg-sndr");
+      if (!sender) return;
+      node.__medAct = true;
+      var actions = ce("div", "med-msg-actions");
+      var copy = ce("button", "med-msg-act", "⎘"); copy.title = "Copy message";
+      var reply = ce("button", "med-msg-act", "↩"); reply.title = "Quick reply (fills Send SMS)";
+      on(copy, "click", function (e) {
+        e.stopPropagation();
+        var t = node.querySelector(".msg-txt"); if (!t) return;
+        try { navigator.clipboard.writeText(t.textContent.trim()); } catch (err) {}
+        copy.textContent = "✓"; setTimeout(function () { copy.textContent = "⎘"; }, 1000);
+      });
+      on(reply, "click", function (e) {
+        e.stopPropagation();
+        var num = sender.textContent.trim();
+        var to = $("#sTo"); var msg = $("#sMsg");
+        if (to) to.value = num;
+        if (msg) msg.focus();
+        var tab = $('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
+      });
+      actions.appendChild(copy); actions.appendChild(reply);
+      node.appendChild(actions);
+    }
+    ["msgList", "amList"].forEach(function (id) {
+      var c = document.getElementById(id); if (!c) return;
+      var mo = new MutationObserver(function () {
+        $$('#' + id + ' > *').forEach(decorate);
+      });
+      mo.observe(c, { childList: true, subtree: true });
+      setTimeout(function () { $$('#' + id + ' > *').forEach(decorate); }, 1500);
+    });
+  }
+
+  /* (kept as separate hook for future expansion) */
+  function initQuickReply() {}
+
+  /* ─────────────────────────────────────────────────────────────
+     Activity ticker — corner toast on new incoming message
+     ───────────────────────────────────────────────────────────── */
+  function initActivityTicker() {
+    var stack = ce("div", "med-tick");
+    document.body.appendChild(stack);
+    function pop(devName, snippet) {
+      var card = ce("div", "med-tick-card",
+        '<div class="med-tick-d">📩 ' + escH(devName) + '</div>' +
+        '<div>' + escH(snippet.length > 80 ? snippet.slice(0, 80) + "…" : snippet) + '</div>'
+      );
+      stack.appendChild(card);
+      setTimeout(function () {
+        card.style.transition = "opacity .4s, transform .4s";
+        card.style.opacity = "0"; card.style.transform = "translateX(20px)";
+        setTimeout(function () { card.remove(); }, 400);
+      }, 4500);
+      while (stack.children.length > 4) stack.removeChild(stack.firstChild);
+    }
+    /* Watch #msgList for new INCOMING bubbles only (skip on first load) */
+    var c = document.getElementById("msgList");
+    if (!c) return;
+    var firstScanDone = false;
+    setTimeout(function () { firstScanDone = true; }, 3000);
+    var mo = new MutationObserver(function (muts) {
+      if (!firstScanDone) return;
+      muts.forEach(function (m) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType !== 1) return;
+          /* heuristic: incoming bubbles often have "in"/"incoming" class */
+          var cls = (n.className || "") + "";
+          if (!/in|incoming|received/i.test(cls) && !n.querySelector('[class*="in"]')) return;
+          var t = n.querySelector(".msg-txt"); if (!t) return;
+          var dn = $(".msg-dn") || $(".dev-item.sel .dev-n");
+          pop((dn && dn.textContent.trim()) || "Device", t.textContent.trim());
+        });
+      });
+    });
+    mo.observe(c, { childList: true });
+  }
+
+})();
+</script>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   MEDLINE — iOS-smooth motion + Live Analytics on Overview
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  if (window.__medSmoothInit) return; window.__medSmoothInit = true;
+
+  function $(s, r)  { return (r || document).querySelector(s); }
+  function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
+  function ce(t, c, h) { var e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; }
+  function escH(s) { return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+  function isViewer() { return document.body.classList.contains("share-mode"); }
+  function getFbUrl() {
+    /* 1. captured from network (most reliable after connect) */
+    if (window.__medCapturedFbUrl) return window.__medCapturedFbUrl;
+    /* 2. visible input */
+    var v = ($("#fbUrl") || {}).value || "";
+    /* 3. Firebase SDK global if present */
+    if (!v) {
+      try {
+        if (window.firebase && firebase.apps && firebase.apps[0])
+          v = firebase.apps[0].options.databaseURL || "";
+      } catch (e) {}
+    }
+    /* 4. localStorage probes */
+    if (!v) {
+      try {
+        var keys = ["medline_fb_url", "fbUrl", "fb_url", "firebase_url", "fbURL", "FB_URL"];
+        for (var i = 0; i < keys.length; i++) {
+          var x = localStorage.getItem(keys[i]);
+          if (x && /firebaseio\.com|firebasedatabase\.app/.test(x)) { v = x; break; }
+        }
+      } catch (e) {}
+    }
+    return String(v || "").trim().replace(/\/+$/, "");
+  }
+
+  /* ── early capture: hook fetch + WebSocket to record Firebase host ── */
+  (function captureFb() {
+    function record(u) {
+      try {
+        var m = String(u).match(/^(https?:\/\/[^\/?#]+)/);
+        if (!m) return;
+        var origin = m[1];
+        if (!/firebaseio\.com|firebasedatabase\.app/.test(origin)) return;
+        if (window.__medCapturedFbUrl) return;
+        window.__medCapturedFbUrl = origin;
+        try { localStorage.setItem("medline_fb_url", origin); } catch (e) {}
+        console.log("[MED] Firebase URL captured:", origin);
+      } catch (e) {}
+    }
+    var of = window.fetch;
+    if (of && !of.__medHooked) {
+      window.fetch = function (u) { record(typeof u === "string" ? u : (u && u.url)); return of.apply(this, arguments); };
+      window.fetch.__medHooked = true;
+    }
+    var OW = window.WebSocket;
+    if (OW && !OW.__medHooked) {
+      window.WebSocket = function (url, p) { record(url); return p ? new OW(url, p) : new OW(url); };
+      window.WebSocket.prototype = OW.prototype;
+      window.WebSocket.__medHooked = true;
+    }
+    var OX = window.XMLHttpRequest && window.XMLHttpRequest.prototype && window.XMLHttpRequest.prototype.open;
+    if (OX && !OX.__medHooked) {
+      window.XMLHttpRequest.prototype.open = function (m, u) { record(u); return OX.apply(this, arguments); };
+      window.XMLHttpRequest.prototype.open.__medHooked = true;
+    }
+  })();
+
+  injectSmoothCSS();
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+
+  function boot() {
+    setTimeout(function () {
+      mountTabIndicator();
+      mountAnalytics();
+      enhanceModals();
+      enhanceButtons();
+      smoothScrolling();
+    }, 800);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     iOS-style motion CSS — spring curves, fluid transitions
+     ───────────────────────────────────────────────────────────── */
+  function injectSmoothCSS() {
+    var css = `
+    :root {
+      --med-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+      --med-ease-quint: cubic-bezier(0.22, 1, 0.36, 1);
+      --med-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+      --med-ease-soft-spring: cubic-bezier(0.5, 1.25, 0.65, 1);
+      --med-ease-io: cubic-bezier(0.65, 0, 0.35, 1);
+    }
+
+    /* anti-jitter base */
+    body, .panel, .body, .main, .sb, .tabs, .tab-body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+    .dev-item, .tab, .pill, .sc, .nuke-card, .fwd-card, .sh-card, button { will-change: transform; backface-visibility: hidden; }
+
+    /* ── buttons: spring press + lift ─────────────────────── */
+    .tb-btn, .mbtn, .sbf, .mfb, .stb, .nuke-sim-btn, .sh-btn, .sh-mini,
+    .med-set-opt, .med-cog, .cta, .sbtn, .mbtn-del-all, .otp-note-save, .ms-cp, .cpb,
+    .sfbtn, .fwd-save-btn, .stbtn, .nuke-stop, .share-gate-btn {
+      transition:
+        transform .35s var(--med-ease-spring),
+        background-color .25s var(--med-ease-out),
+        background .25s var(--med-ease-out),
+        color .2s var(--med-ease-out),
+        border-color .25s var(--med-ease-out),
+        box-shadow .35s var(--med-ease-out) !important;
+    }
+    .tb-btn:active, .mbtn:active, .sbf:active, .mfb:active, .stb:active,
+    .nuke-sim-btn:active, .sh-btn:active, .sh-mini:active, .med-set-opt:active,
+    .med-cog:active, .cta:active, .sbtn:active, .otp-note-save:active,
+    .ms-cp:active, .cpb:active, .sfbtn:active, .fwd-save-btn:active, .share-gate-btn:active {
+      transform: scale(.94) !important;
+      transition-duration: .08s !important;
+    }
+    .tb-btn:hover, .mbtn:hover, .sbf:hover, .mfb:hover, .stb:hover,
+    .sh-mini:hover, .med-cog:hover {
+      transform: translateY(-1px);
+    }
+
+    /* ── tabs: smooth highlight on hover ──────────────────── */
+    .tab {
+      transition: color .25s var(--med-ease-out), background-color .25s var(--med-ease-out) !important;
+    }
+    .tab:active { transform: scale(.97); transition-duration: .08s !important; }
+
+    /* hide our previous static tab underline; replace with sliding one */
+    .tab.active::after { display: none !important; }
+    .med-tab-ind {
+      position: absolute; bottom: -1px; left: 0;
+      height: 2px; width: 0;
+      background: linear-gradient(90deg, #00d4ff, #c084fc);
+      border-radius: 2px;
+      box-shadow: 0 0 12px rgba(0,212,255,.6), 0 0 24px rgba(192,132,252,.25);
+      transition:
+        transform .55s var(--med-ease-out),
+        width .55s var(--med-ease-out),
+        opacity .25s var(--med-ease-out);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateX(0);
+    }
+
+    /* ── pane crossfade + lift on switch ──────────────────── */
+    .pane.active { animation: med-pane-in .45s var(--med-ease-out); }
+    @keyframes med-pane-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── sidebar items: subtle staggered fade-in ──────────── */
+    .dev-item {
+      animation: med-side-in .5s var(--med-ease-out) backwards;
+      transition:
+        background-color .3s var(--med-ease-out),
+        transform .35s var(--med-ease-spring),
+        box-shadow .3s var(--med-ease-out) !important;
+    }
+    .dev-item:nth-child(1) { animation-delay: .02s; }
+    .dev-item:nth-child(2) { animation-delay: .04s; }
+    .dev-item:nth-child(3) { animation-delay: .06s; }
+    .dev-item:nth-child(4) { animation-delay: .08s; }
+    .dev-item:nth-child(5) { animation-delay: .10s; }
+    .dev-item:nth-child(6) { animation-delay: .12s; }
+    .dev-item:nth-child(7) { animation-delay: .14s; }
+    .dev-item:nth-child(8) { animation-delay: .16s; }
+    .dev-item:nth-child(9) { animation-delay: .18s; }
+    .dev-item:nth-child(10){ animation-delay: .20s; }
+    .dev-item:nth-child(n+11) { animation-delay: .22s; }
+    @keyframes med-side-in {
+      from { opacity: 0; transform: translateX(-14px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+    .dev-item:active { transform: scale(.98) !important; transition-duration: .1s !important; }
+
+    /* ── modal/overlay pop-in: spring ─────────────────────── */
+    .med-set, .cmdk, .help-card, .share-gate-card {
+      animation: med-modal-pop .55s var(--med-ease-soft-spring) !important;
+      will-change: transform, opacity;
+    }
+    @keyframes med-modal-pop {
+      0%   { transform: scale(.86); opacity: 0; filter: blur(6px); }
+      55%  { transform: scale(1.02); opacity: 1; filter: blur(0); }
+      100% { transform: scale(1); }
+    }
+    .med-set-back, .cmdk-back, .help-back, .share-gate {
+      animation: med-back-in .35s var(--med-ease-out) !important;
+    }
+    @keyframes med-back-in {
+      from { opacity: 0; backdrop-filter: blur(0px); -webkit-backdrop-filter: blur(0px); }
+      to   { opacity: 1; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+    }
+
+    /* ── stat cards: smoother lift ────────────────────────── */
+    .sc, .nuke-card, .fwd-card, .sh-card, .ov-banner, .stat-grid > * {
+      transition:
+        transform .45s var(--med-ease-out),
+        box-shadow .45s var(--med-ease-out),
+        border-color .35s var(--med-ease-out),
+        background .35s var(--med-ease-out) !important;
+    }
+    .sc:hover, .fwd-card:hover, .sh-card:hover {
+      transform: translateY(-3px) !important;
+    }
+
+    /* ── messages: soft entrance ──────────────────────────── */
+    .msg-list > *, .am-row, [class*="msg-bubble"] {
+      animation: med-msg-in .4s var(--med-ease-out) backwards;
+      transition:
+        transform .3s var(--med-ease-spring),
+        box-shadow .3s var(--med-ease-out),
+        background-color .25s var(--med-ease-out) !important;
+    }
+    @keyframes med-msg-in {
+      from { opacity: 0; transform: translateY(10px) scale(.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* ── pill counters: gentle scale on change ────────────── */
+    .pill { transition: transform .35s var(--med-ease-spring), box-shadow .25s var(--med-ease-out) !important; }
+    .pill.med-pulse { animation: med-pill-pulse .55s var(--med-ease-soft-spring); }
+    @keyframes med-pill-pulse {
+      0%   { transform: scale(1); }
+      40%  { transform: scale(1.12); box-shadow: 0 0 18px rgba(0,212,255,.4); }
+      100% { transform: scale(1); }
+    }
+
+    /* ── inputs: smoother focus glow ──────────────────────── */
+    input, textarea, .fi, .sinp, .sarea, .sh-inp, .nuke-inp, .otp-note-inp, .share-gate-inp, .cmdk-inp {
+      transition:
+        border-color .25s var(--med-ease-out),
+        box-shadow .35s var(--med-ease-out),
+        background-color .25s var(--med-ease-out) !important;
+    }
+    input:focus, textarea:focus, .fi:focus, .sinp:focus, .sarea:focus, .sh-inp:focus,
+    .nuke-inp:focus, .otp-note-inp:focus, .share-gate-inp:focus, .cmdk-inp:focus {
+      box-shadow: 0 0 0 3px rgba(0,212,255,.15), 0 0 24px rgba(0,212,255,.1) !important;
+      outline: none !important;
+    }
+
+    /* ── toasts already use cubic-bezier ──────────────────── */
+    .med-tick-card { animation: med-tick-slide .55s var(--med-ease-soft-spring) !important; }
+    @keyframes med-tick-slide {
+      from { transform: translateX(28px) scale(.95); opacity: 0; }
+      to   { transform: translateX(0) scale(1); opacity: 1; }
+    }
+
+    /* ── smooth scrolling everywhere ──────────────────────── */
+    html, body, .pane, .sb-list, .tab-body, .msg-list, .am-scroll, .tbl-wrap, [id$="List"], [class*="-list"], [class*="-wrap"] {
+      scroll-behavior: smooth;
+    }
+
+    /* ── sidebar: smooth width transition ─────────────────── */
+    .sb {
+      transition: width .45s var(--med-ease-out), min-width .45s var(--med-ease-out) !important;
+    }
+
+    /* ── disable some animations when user prefers ────────── */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        transition-duration: .01ms !important;
+      }
+    }
+
+    /* ═══════════════════════════════════════════════════════
+       LIVE ANALYTICS — Overview charts
+       ═══════════════════════════════════════════════════════ */
+    .med-an-section { margin-top: 26px; }
+    .med-an-h {
+      font-size: 11px; font-weight: 800; color: #00d4ff;
+      letter-spacing: 2px; text-transform: uppercase;
+      margin: 8px 4px 14px; display: flex; align-items: center; gap: 10px;
+    }
+    .med-an-h::after {
+      content: ""; flex: 1; height: 1px;
+      background: linear-gradient(90deg, rgba(0,212,255,.3), transparent);
+    }
+    .med-an-h .med-an-refresh {
+      background: rgba(0,212,255,.08); border: 1px solid rgba(0,212,255,.2);
+      color: #00d4ff; padding: 4px 10px; border-radius: 6px;
+      font-size: 10px; font-weight: 800; letter-spacing: 1px; cursor: pointer;
+      font-family: 'Exo 2', sans-serif;
+    }
+    .med-an-grid {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    @media (max-width: 1100px) { .med-an-grid { grid-template-columns: 1fr; } }
+    .med-an-card {
+      background: rgba(10,20,34,.55);
+      backdrop-filter: blur(18px) saturate(160%);
+      -webkit-backdrop-filter: blur(18px) saturate(160%);
+      border: 1px solid rgba(0,212,255,.13);
+      border-radius: 14px;
+      padding: 18px 18px 14px;
+      transition: all .45s var(--med-ease-out);
+      position: relative; overflow: hidden;
+      animation: med-card-in .6s var(--med-ease-out) backwards;
+    }
+    .med-an-card:nth-child(1) { animation-delay: .05s; }
+    .med-an-card:nth-child(2) { animation-delay: .12s; }
+    .med-an-card:nth-child(3) { animation-delay: .19s; }
+    .med-an-card:nth-child(4) { animation-delay: .26s; }
+    @keyframes med-card-in {
+      from { opacity: 0; transform: translateY(20px) scale(.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .med-an-card:hover {
+      transform: translateY(-3px);
+      border-color: rgba(0,212,255,.3) !important;
+      box-shadow: 0 16px 50px rgba(0,212,255,.12);
+    }
+    .med-an-t {
+      font-size: 11px; font-weight: 700; color: #8aa;
+      text-transform: uppercase; letter-spacing: 1.2px;
+      margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center;
+    }
+    .med-an-t .tag {
+      font-size: 9px; padding: 2px 7px; border-radius: 5px;
+      background: rgba(0,212,170,.12); color: #00d4aa;
+      font-weight: 800; letter-spacing: .8px;
+    }
+    .med-an-v {
+      font-size: 28px; font-weight: 900; color: #cfe;
+      margin-bottom: 12px; font-variant-numeric: tabular-nums;
+      letter-spacing: -0.5px; line-height: 1;
+    }
+    .med-an-v small { font-size: 12px; color: #678; font-weight: 600; margin-left: 6px; letter-spacing: 0; }
+    .med-an-empty { text-align: center; padding: 32px 12px; color: #566; font-size: 12px; }
+    .med-an-svg { width: 100%; display: block; }
+
+    /* — donut — */
+    .med-dn-wrap { display: flex; align-items: center; gap: 18px; }
+    .med-dn-svg { width: 130px; height: 130px; flex-shrink: 0; }
+    .med-dn-svg circle.bg { fill: none; stroke: rgba(255,255,255,.04); stroke-width: 14; }
+    .med-dn-svg circle.fg {
+      fill: none; stroke-width: 14; stroke-linecap: round;
+      transform: rotate(-90deg); transform-origin: 50% 50%;
+      transition: stroke-dasharray .9s var(--med-ease-out);
+    }
+    .med-dn-center {
+      position: relative; width: 0; height: 0;
+    }
+    .med-dn-center-text {
+      position: absolute; left: -65px; top: -10px; width: 130px; text-align: center;
+      pointer-events: none;
+      font-weight: 900; font-size: 24px; color: #cfe;
+      font-variant-numeric: tabular-nums; line-height: 1;
+    }
+    .med-dn-center-sub {
+      position: absolute; left: -65px; top: 18px; width: 130px; text-align: center;
+      font-size: 10px; color: #678; letter-spacing: 1px; text-transform: uppercase;
+    }
+    .med-dn-legend { flex: 1; min-width: 0; }
+    .med-dn-leg {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 12px; padding: 5px 0; color: #cfe;
+    }
+    .med-dn-dot {
+      width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+      box-shadow: 0 0 8px currentColor;
+    }
+    .med-dn-num {
+      margin-left: auto; font-weight: 800;
+      font-variant-numeric: tabular-nums; color: #cfe;
+    }
+    .med-dn-pct { font-size: 10px; color: #566; margin-left: 6px; }
+
+    /* — top devices bars — */
+    .med-bar-row {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 7px; font-size: 12px;
+    }
+    .med-bar-name {
+      width: 120px; color: #cfe; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; flex-shrink: 0; font-size: 11px; font-weight: 600;
+    }
+    .med-bar-track {
+      flex: 1; height: 16px;
+      background: rgba(0,212,255,.05);
+      border-radius: 8px; overflow: hidden; position: relative;
+    }
+    .med-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #00d4ff, #c084fc);
+      border-radius: 8px; transform-origin: left;
+      transform: scaleX(0);
+      transition: transform 1s var(--med-ease-out);
+      box-shadow: 0 0 12px rgba(0,212,255,.3);
+    }
+    .med-bar-val {
+      width: 44px; text-align: right; color: #00d4aa;
+      font-weight: 800; font-variant-numeric: tabular-nums; font-size: 11px;
+    }
+
+    /* — line chart — */
+    .med-ln-wrap { padding-top: 4px; position: relative; }
+    .med-ln-svg path.area {
+      fill: url(#medLnGrad);
+      opacity: 0;
+      transition: opacity .8s var(--med-ease-out);
+    }
+    .med-ln-svg path.line {
+      fill: none; stroke: #00d4ff; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+      stroke-dasharray: 1500; stroke-dashoffset: 1500;
+      transition: stroke-dashoffset 1.4s var(--med-ease-out);
+      filter: drop-shadow(0 0 4px rgba(0,212,255,.5));
+    }
+    .med-ln-svg.in path.line { stroke-dashoffset: 0; }
+    .med-ln-svg.in path.area { opacity: 1; }
+    .med-ln-svg .axis { stroke: rgba(255,255,255,.05); stroke-width: 1; }
+    .med-ln-svg .lbl { font-size: 9px; fill: #566; font-family: 'Share Tech Mono', monospace; }
+    .med-ln-svg .pt { fill: #00d4ff; transition: r .2s; opacity: 0; transition: opacity .3s var(--med-ease-out) .8s; }
+    .med-ln-svg.in .pt { opacity: 1; }
+    .med-ln-svg .pt:hover { r: 5; }
+
+    /* — heatmap — */
+    .med-hm {
+      display: grid; grid-template-columns: 24px repeat(24, 1fr);
+      gap: 2px; margin-top: 6px;
+    }
+    .med-hm-cell {
+      aspect-ratio: 1; border-radius: 2px;
+      transition: transform .2s var(--med-ease-spring), box-shadow .15s;
+      cursor: default; min-width: 0;
+      animation: med-cell-in .6s var(--med-ease-out) backwards;
+    }
+    @keyframes med-cell-in {
+      from { opacity: 0; transform: scale(.5); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .med-hm-cell:hover {
+      transform: scale(1.6); z-index: 5; position: relative;
+      box-shadow: 0 0 10px rgba(0,212,255,.7);
+    }
+    .med-hm-lbl {
+      font-size: 8px; color: #566; text-align: right;
+      padding-right: 4px; align-self: center; font-family: 'Share Tech Mono', monospace;
+    }
+    .med-hm-hours {
+      display: grid; grid-template-columns: 24px repeat(24, 1fr);
+      gap: 2px; margin-top: 6px; font-size: 8px; color: #566; font-family: 'Share Tech Mono', monospace;
+    }
+    .med-hm-hours div { text-align: center; min-width: 0; }
+
+    .med-tooltip {
+      position: fixed; background: #0a1422; border: 1px solid rgba(0,212,255,.3);
+      border-radius: 6px; padding: 6px 10px; color: #cfe; font-size: 11px;
+      pointer-events: none; z-index: 9999;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+      transform: translate(-50%, -120%);
+      opacity: 0; transition: opacity .15s;
+      font-family: 'Exo 2', sans-serif;
+    }
+    .med-tooltip.show { opacity: 1; }
+    `;
+    var s = document.createElement("style");
+    s.id = "medSmoothStyle";
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Sliding tab indicator
+     ───────────────────────────────────────────────────────────── */
+  function mountTabIndicator() {
+    var tabs = $(".tabs"); if (!tabs) return;
+    if ($(".med-tab-ind", tabs)) return;
+    tabs.style.position = tabs.style.position || "relative";
+    var ind = ce("div", "med-tab-ind");
+    tabs.appendChild(ind);
+
+    function move() {
+      var act = $(".tab.active", tabs);
+      if (!act || act.offsetParent === null) { ind.style.opacity = "0"; return; }
+      var r = act.getBoundingClientRect();
+      var pr = tabs.getBoundingClientRect();
+      var w = r.width * 0.76;
+      var x = r.left - pr.left + (r.width - w) / 2;
+      ind.style.opacity = "1";
+      ind.style.width = w + "px";
+      ind.style.transform = "translateX(" + x + "px)";
+    }
+    /* Watch every tab's class for changes */
+    var mo = new MutationObserver(move);
+    $$(".tab", tabs).forEach(function (t) {
+      mo.observe(t, { attributes: true, attributeFilter: ["class"] });
+    });
+    /* Also re-bind to any new tabs added later (e.g. Share tab) */
+    var moTabs = new MutationObserver(function (muts) {
+      muts.forEach(function (m) {
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType === 1 && n.classList && n.classList.contains("tab")) {
+            mo.observe(n, { attributes: true, attributeFilter: ["class"] });
+            move();
+          }
+        });
+      });
+    });
+    moTabs.observe(tabs, { childList: true });
+
+    setTimeout(move, 50);
+    setTimeout(move, 400);
+    setTimeout(move, 1000);
+    window.addEventListener("resize", move);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     Pulse pill counters when their value changes
+     ───────────────────────────────────────────────────────────── */
+  function enhanceButtons() {
+    $$(".pill").forEach(function (p) {
+      var last = p.textContent.trim();
+      var mo = new MutationObserver(function () {
+        var cur = p.textContent.trim();
+        if (cur !== last) {
+          last = cur;
+          p.classList.remove("med-pulse");
+          void p.offsetWidth;
+          p.classList.add("med-pulse");
+        }
+      });
+      mo.observe(p, { childList: true, characterData: true, subtree: true });
+    });
+  }
+
+  function enhanceModals() { /* CSS handles it */ }
+  function smoothScrolling() { /* CSS handles it */ }
+
+  /* ─────────────────────────────────────────────────────────────
+     LIVE ANALYTICS — mount cards + fetch + render
+     ───────────────────────────────────────────────────────────── */
+  function mountAnalytics(tries) {
+    tries = tries || 0;
+    var pane = $("#pane-overview");
+    if ($("#medAnSection")) return;
+    if (!pane) {
+      if (tries < 30) return setTimeout(function () { mountAnalytics(tries + 1); }, 400);
+      return;
+    }
+
+    var section = ce("div", "med-an-section");
+    section.id = "medAnSection";
+    section.innerHTML =
+      '<div class="med-an-h">📈 Live Analytics ' +
+        '<button class="med-an-refresh" id="medAnRefresh">↻ Refresh</button>' +
+      '</div>' +
+      '<div class="med-an-grid">' +
+        '<div class="med-an-card" id="medAnStatus">' +
+          '<div class="med-an-t">Status Distribution <span class="tag" id="medAnStatusTag">live</span></div>' +
+          '<div class="med-dn-wrap" id="medAnStatusBody"><div class="med-an-empty">Connect to load…</div></div>' +
+        '</div>' +
+        '<div class="med-an-card" id="medAnTop">' +
+          '<div class="med-an-t">Top 10 Active Devices <span class="tag">by msg count</span></div>' +
+          '<div id="medAnTopBody"><div class="med-an-empty">Connect to load…</div></div>' +
+        '</div>' +
+        '<div class="med-an-card" id="medAn24h">' +
+          '<div class="med-an-t">24-Hour Activity <span class="tag" id="medAn24Tag">last 24h</span></div>' +
+          '<div class="med-an-v" id="medAn24Total">— <small>messages</small></div>' +
+          '<div class="med-ln-wrap" id="medAn24Body"><div class="med-an-empty">Connect to load…</div></div>' +
+        '</div>' +
+        '<div class="med-an-card" id="medAnHm">' +
+          '<div class="med-an-t">Activity Heatmap <span class="tag">7d × 24h</span></div>' +
+          '<div id="medAnHmBody"><div class="med-an-empty">Connect to load…</div></div>' +
+        '</div>' +
+      '</div>';
+    /* Insert above the "Devices — Newest First" table so charts are visible without scrolling */
+    var insertBefore = pane.querySelector(".sec-hdr") || pane.querySelector(".tbl-wrap") || null;
+    if (insertBefore) pane.insertBefore(section, insertBefore);
+    else pane.appendChild(section);
+
+    /* Floating tooltip */
+    var tip = ce("div", "med-tooltip"); tip.id = "medTooltip";
+    document.body.appendChild(tip);
+
+    $("#medAnRefresh").addEventListener("click", function () { runAnalytics(true); });
+
+    /* Render donut from live UI pills (always works) */
+    renderStatusFromPills();
+    setInterval(renderStatusFromPills, 4000);
+
+    /* Run full analytics when overview becomes active */
+    var lastRun = 0;
+    function maybeRun() {
+      var p = $("#pane-overview");
+      if (p && p.classList.contains("active") && Date.now() - lastRun > 25000) {
+        lastRun = Date.now();
+        runAnalytics(false);
+      }
+    }
+    setInterval(maybeRun, 5000);
+    setTimeout(maybeRun, 1500);
+  }
+
+  /* — Status donut from existing toolbar pills — */
+  function renderStatusFromPills() {
+    var body = $("#medAnStatusBody"); if (!body) return;
+    var totEl = $("#tpTot") || $("#ov-tot") || $("#sv-tot");
+    var onEl  = $("#tpOn")  || $("#ov-on")  || $("#sv-on");
+    var offEl = $("#tpOff") || $("#ov-off") || $("#sv-off");
+    var upiEl = $("#ov-upi") || $("#sv-sim");
+    function n(el) { if (!el) return 0; var m = (el.textContent || "").match(/-?\d+/); return m ? parseInt(m[0], 10) : 0; }
+    var tot = n(totEl), onN = n(onEl), offN = n(offEl), upi = n(upiEl);
+    if (!tot) {
+      if (!body.querySelector(".med-an-empty")) body.innerHTML = '<div class="med-an-empty">Waiting for device list…</div>';
+      return;
+    }
+    var pctOn = tot ? Math.round(onN / tot * 100) : 0;
+    var legend = [
+      { name: "Online", val: onN, color: "#00d4aa" },
+      { name: "Offline", val: offN, color: "#ff6b6b" }
+    ];
+    if (upi) legend.push({ name: "UPI / SIM", val: upi, color: "#c084fc" });
+
+    var R = 50, C = 2 * Math.PI * R;
+    var segments = "";
+    var off = 0;
+    var allItems = [
+      { val: onN, color: "#00d4aa" },
+      { val: offN, color: "#ff6b6b" }
+    ];
+    var sum = onN + offN || 1;
+    allItems.forEach(function (it) {
+      var len = (it.val / sum) * C;
+      segments +=
+        '<circle class="fg" cx="65" cy="65" r="' + R + '" stroke="' + it.color + '"' +
+        ' stroke-dasharray="' + len + ' ' + (C - len) + '"' +
+        ' stroke-dashoffset="' + (-off) + '" />';
+      off += len;
+    });
+
+    body.innerHTML =
+      '<svg class="med-dn-svg" viewBox="0 0 130 130">' +
+        '<circle class="bg" cx="65" cy="65" r="' + R + '" />' +
+        segments +
+      '</svg>' +
+      '<div class="med-dn-center">' +
+        '<div class="med-dn-center-text">' + pctOn + '%</div>' +
+        '<div class="med-dn-center-sub">online</div>' +
+      '</div>' +
+      '<div class="med-dn-legend">' +
+        legend.map(function (l) {
+          var pct = tot ? Math.round(l.val / tot * 100) : 0;
+          return '<div class="med-dn-leg">' +
+            '<span class="med-dn-dot" style="background:' + l.color + ';color:' + l.color + '"></span>' +
+            escH(l.name) +
+            '<span class="med-dn-num">' + l.val + '<span class="med-dn-pct">(' + pct + '%)</span></span>' +
+          '</div>';
+        }).join("") +
+      '</div>';
+  }
+
+  /* — Full analytics: top devices + 24h + heatmap — */
+  async function runAnalytics(force) {
+    var fb = getFbUrl();
+    if (!fb) return;
+
+    var topBody = $("#medAnTopBody");
+    var lnBody  = $("#medAn24Body");
+    var hmBody  = $("#medAnHmBody");
+
+    /* fetch shallow client list */
+    var clients;
+    try {
+      var r = await fetch(fb + "/clients.json?shallow=true", { cache: "no-store" });
+      clients = await r.json();
+    } catch (e) {
+      [topBody, lnBody, hmBody].forEach(function (b) {
+        if (b) b.innerHTML = '<div class="med-an-empty">Could not reach Firebase: ' + escH(e.message) + '</div>';
+      });
+      return;
+    }
+    if (!clients || typeof clients !== "object") {
+      [topBody, lnBody, hmBody].forEach(function (b) {
+        if (b) b.innerHTML = '<div class="med-an-empty">No data at /clients</div>';
+      });
+      return;
+    }
+    var ids = Object.keys(clients);
+    if (!ids.length) return;
+
+    /* For each device (cap at 80 for perf), shallow-fetch messages to count */
+    var sample = ids.slice(0, 80);
+    var counts = await Promise.all(sample.map(async function (id) {
+      var paths = ["messages", "sms", "msgs", "inbox"];
+      for (var i = 0; i < paths.length; i++) {
+        try {
+          var rr = await fetch(fb + "/clients/" + encodeURIComponent(id) + "/" + paths[i] + ".json?shallow=true", { cache: "no-store" });
+          if (!rr.ok) continue;
+          var j = await rr.json();
+          if (j && typeof j === "object") {
+            return { id: id, count: Object.keys(j).length, path: paths[i], keys: Object.keys(j) };
+          }
+        } catch (e) {}
+      }
+      return { id: id, count: 0, path: null, keys: [] };
+    }));
+
+    renderTopDevices(counts);
+
+    /* For 24h + heatmap, sample top 5 chatty devices' last ~120 messages with full data */
+    var top5 = counts.slice().sort(function (a, b) { return b.count - a.count; }).slice(0, 5).filter(function (c) { return c.path; });
+    if (!top5.length) {
+      lnBody.innerHTML = '<div class="med-an-empty">No messages found yet.</div>';
+      hmBody.innerHTML = '<div class="med-an-empty">No messages found yet.</div>';
+      return;
+    }
+    var msgArrs = await Promise.all(top5.map(async function (d) {
+      try {
+        var rr = await fetch(fb + "/clients/" + encodeURIComponent(d.id) + "/" + d.path + ".json?orderBy=%22%24key%22&limitToLast=200", { cache: "no-store" });
+        if (!rr.ok) return [];
+        var j = await rr.json();
+        if (!j) return [];
+        return Object.keys(j).map(function (k) { return [k, j[k]]; });
+      } catch (e) { return []; }
+    }));
+    var allMsgs = [].concat.apply([], msgArrs);
+
+    var stamps = allMsgs.map(extractTimestamp).filter(function (t) { return t > 0; });
+    if (!stamps.length) {
+      lnBody.innerHTML = '<div class="med-an-empty">Messages have no readable timestamps.</div>';
+      hmBody.innerHTML = '<div class="med-an-empty">Messages have no readable timestamps.</div>';
+      return;
+    }
+    render24h(stamps);
+    renderHeatmap(stamps);
+  }
+
+  function extractTimestamp(pair) {
+    var key = pair[0], val = pair[1];
+    /* try numeric key */
+    var n = parseInt(key, 10);
+    if (isFinite(n) && n > 1000000000) {
+      if (n < 1e12) n *= 1000; /* seconds → ms */
+      if (n > 946684800000 && n < Date.now() + 31536000000) return n;
+    }
+    /* try common timestamp fields */
+    if (val && typeof val === "object") {
+      var fields = ["timestamp", "time", "t", "at", "date", "ts", "createdAt", "received_at", "receivedAt"];
+      for (var i = 0; i < fields.length; i++) {
+        var v = val[fields[i]];
+        if (typeof v === "number" && v > 1000000000) {
+          if (v < 1e12) v *= 1000;
+          if (v > 946684800000 && v < Date.now() + 31536000000) return v;
+        }
+        if (typeof v === "string") {
+          var d = Date.parse(v);
+          if (isFinite(d) && d > 946684800000) return d;
+        }
+      }
+    }
+    return 0;
+  }
+
+  function renderTopDevices(counts) {
+    var body = $("#medAnTopBody"); if (!body) return;
+    var top = counts.slice().sort(function (a, b) { return b.count - a.count; }).slice(0, 10).filter(function (c) { return c.count > 0; });
+    if (!top.length) { body.innerHTML = '<div class="med-an-empty">No message data found.</div>'; return; }
+    var max = top[0].count || 1;
+    body.innerHTML = top.map(function (d, i) {
+      var pct = (d.count / max) * 100;
+      return '<div class="med-bar-row">' +
+        '<div class="med-bar-name" title="' + escH(d.id) + '">' + escH(d.id) + '</div>' +
+        '<div class="med-bar-track"><div class="med-bar-fill" data-pct="' + pct + '"></div></div>' +
+        '<div class="med-bar-val">' + d.count + '</div>' +
+      '</div>';
+    }).join("");
+    /* trigger animation */
+    requestAnimationFrame(function () {
+      $$('.med-bar-fill', body).forEach(function (b, i) {
+        setTimeout(function () { b.style.transform = "scaleX(" + (parseFloat(b.dataset.pct) / 100) + ")"; }, i * 60);
+      });
+    });
+  }
+
+  function render24h(stamps) {
+    var body = $("#medAn24Body"); if (!body) return;
+    var totalEl = $("#medAn24Total");
+    var now = Date.now();
+    var since = now - 24 * 3600 * 1000;
+    var bins = new Array(24).fill(0);
+    var total = 0;
+    stamps.forEach(function (t) {
+      if (t < since || t > now) return;
+      var hoursAgo = Math.floor((now - t) / 3600000);
+      if (hoursAgo >= 0 && hoursAgo < 24) {
+        bins[23 - hoursAgo]++;
+        total++;
+      }
+    });
+    if (totalEl) {
+      totalEl.innerHTML = String(total) + ' <small>messages</small>';
+    }
+    if (!total) { body.innerHTML = '<div class="med-an-empty">No messages in the last 24h.</div>'; return; }
+    var W = 520, H = 130, P = 24;
+    var max = Math.max.apply(null, bins) || 1;
+    var step = (W - P * 2) / 23;
+    var pts = bins.map(function (v, i) {
+      var x = P + i * step;
+      var y = H - P - (v / max) * (H - P * 2);
+      return [x, y];
+    });
+    var line = pts.map(function (p, i) { return (i === 0 ? "M" : "L") + p[0] + "," + p[1]; }).join(" ");
+    var area = line + " L" + pts[pts.length - 1][0] + "," + (H - P) + " L" + pts[0][0] + "," + (H - P) + " Z";
+    var ptsSvg = pts.map(function (p, i) {
+      return '<circle class="pt" cx="' + p[0] + '" cy="' + p[1] + '" r="3" data-h="' + i + '" data-v="' + bins[i] + '" />';
+    }).join("");
+    body.innerHTML =
+      '<svg class="med-ln-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="height:140px">' +
+        '<defs><linearGradient id="medLnGrad" x1="0" y1="0" x2="0" y2="1">' +
+          '<stop offset="0%" stop-color="#00d4ff" stop-opacity=".4"/>' +
+          '<stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>' +
+        '</linearGradient></defs>' +
+        '<line class="axis" x1="' + P + '" y1="' + (H - P) + '" x2="' + (W - P) + '" y2="' + (H - P) + '"/>' +
+        '<text class="lbl" x="' + P + '" y="' + (H - 6) + '">24h ago</text>' +
+        '<text class="lbl" x="' + (W - P - 18) + '" y="' + (H - 6) + '">now</text>' +
+        '<path class="area" d="' + area + '"/>' +
+        '<path class="line" d="' + line + '"/>' +
+        ptsSvg +
+      '</svg>';
+    var svg = $(".med-ln-svg", body);
+    requestAnimationFrame(function () { setTimeout(function () { svg.classList.add("in"); }, 30); });
+    /* tooltips on pts */
+    var tip = $("#medTooltip");
+    $$(".pt", svg).forEach(function (c) {
+      c.addEventListener("mouseenter", function (e) {
+        var h = parseInt(c.getAttribute("data-h"), 10);
+        var v = c.getAttribute("data-v");
+        tip.textContent = (23 - h) + "h ago · " + v + " msg";
+        tip.classList.add("show");
+        var r = c.getBoundingClientRect();
+        tip.style.left = (r.left + r.width / 2) + "px";
+        tip.style.top  = r.top + "px";
+      });
+      c.addEventListener("mouseleave", function () { tip.classList.remove("show"); });
+    });
+  }
+
+  function renderHeatmap(stamps) {
+    var body = $("#medAnHmBody"); if (!body) return;
+    var grid = new Array(7);
+    for (var i = 0; i < 7; i++) grid[i] = new Array(24).fill(0);
+    var now = new Date();
+    var since = now.getTime() - 7 * 24 * 3600 * 1000;
+    stamps.forEach(function (t) {
+      if (t < since) return;
+      var d = new Date(t);
+      var dow = d.getDay(); /* 0..6, Sun..Sat */
+      var hr = d.getHours();
+      grid[dow][hr]++;
+    });
+    var max = 0;
+    grid.forEach(function (row) { row.forEach(function (v) { if (v > max) max = v; }); });
+    if (!max) { body.innerHTML = '<div class="med-an-empty">Not enough recent activity.</div>'; return; }
+    var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    var html = '';
+    days.forEach(function (dn, di) {
+      html += '<div class="med-hm-lbl">' + dn + '</div>';
+      grid[di].forEach(function (v, hi) {
+        var ratio = v / max;
+        var bg = ratio === 0
+          ? "rgba(255,255,255,.04)"
+          : "rgba(0,212,255," + (0.12 + ratio * 0.78) + ")";
+        var delay = (di * 24 + hi) * 4;
+        html += '<div class="med-hm-cell" style="background:' + bg + ';animation-delay:' + delay + 'ms" data-d="' + di + '" data-h="' + hi + '" data-v="' + v + '"></div>';
+      });
+    });
+    body.innerHTML =
+      '<div class="med-hm">' + html + '</div>' +
+      '<div class="med-hm-hours"><div></div>' +
+        Array.from({ length: 24 }, function (_, h) {
+          return '<div>' + (h % 6 === 0 ? h : "") + '</div>';
+        }).join("") +
+      '</div>';
+    var tip = $("#medTooltip");
+    $$(".med-hm-cell", body).forEach(function (c) {
+      c.addEventListener("mouseenter", function () {
+        var d = parseInt(c.getAttribute("data-d"), 10);
+        var h = parseInt(c.getAttribute("data-h"), 10);
+        var v = c.getAttribute("data-v");
+        tip.textContent = days[d] + " " + h + ":00 · " + v + " msg";
+        tip.classList.add("show");
+        var r = c.getBoundingClientRect();
+        tip.style.left = (r.left + r.width / 2) + "px";
+        tip.style.top  = r.top + "px";
+      });
+      c.addEventListener("mouseleave", function () { tip.classList.remove("show"); });
+    });
+  }
+})();
+</script>
 </body>
 </html>
