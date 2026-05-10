@@ -2656,7 +2656,466 @@ body{color:var(--text);font-family:'Exo 2',sans-serif;-webkit-font-smoothing:ant
   /* ─────────────────────────────────────────────────────────────
      Quick reply on message hover (uses sender → fills Send SMS)
      ───────────────────────────────────────────────────────────── */
-  function initMsgHoverActions() {
+  function initMsgHoverActions() { initCopyButtons(); initFloatingCopy(); initBubbleCopy(); initDblClickCopy(); }
+
+  /* ═══════════════════════════════════════════════════════════════
+     BUBBLE COPY — find bubbles by walking up from .msg-sndr,
+     inject a hard-styled copy button inside each one.
+     ═══════════════════════════════════════════════════════════════ */
+  function initBubbleCopy() {
+    if (window.__medBubCpy) return; window.__medBubCpy = true;
+
+    var BTN_STYLE =
+      "all:revert!important;" +
+      "display:inline-flex!important;align-items:center;justify-content:center;" +
+      "visibility:visible!important;opacity:1!important;pointer-events:auto!important;" +
+      "position:absolute!important;top:8px!important;right:42px!important;" +
+      "z-index:100!important;" +
+      "width:auto!important;height:auto!important;" +
+      "padding:4px 11px!important;margin:0!important;" +
+      "background:rgba(0,212,255,.22)!important;" +
+      "border:1px solid rgba(0,212,255,.55)!important;" +
+      "border-radius:6px!important;" +
+      "color:#00d4ff!important;" +
+      "font-family:'Exo 2',sans-serif!important;" +
+      "font-size:10px!important;font-weight:800!important;" +
+      "letter-spacing:.5px!important;text-transform:uppercase!important;" +
+      "cursor:pointer!important;line-height:1.2!important;" +
+      "box-shadow:0 2px 10px rgba(0,212,255,.3)!important;" +
+      "transition:all .18s cubic-bezier(.16,1,.3,1)!important;" +
+      "white-space:nowrap!important;text-decoration:none!important;";
+
+    function clean(el) {
+      var c = el.cloneNode(true);
+      c.querySelectorAll("button,.med-cpy,.med-bub-cpy,.med-copy-chip,.med-reply-chip,.med-msg-actions,.med-copy-row,.med-badge,.med-otp-pill,[class*='time'],[class*='Time'],[class*='date'],[class*='Date'],[class*='close'],[class*='del'],[class*='Close'],[class*='Del']").forEach(function (e) { e.remove(); });
+      return (c.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function copyTo(text, btn) {
+      var ok = false;
+      try { navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+      if (!ok) {
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text; ta.style.cssText = "position:fixed;left:-9999px";
+          document.body.appendChild(ta); ta.select();
+          ok = document.execCommand("copy"); ta.remove();
+        } catch (e) {}
+      }
+      if (btn) {
+        var orig = btn.textContent;
+        btn.style.background = "rgba(0,212,170,.3)";
+        btn.style.borderColor = "rgba(0,212,170,.7)";
+        btn.style.color = "#00d4aa";
+        btn.textContent = "✓ COPIED";
+        clearTimeout(btn.__t);
+        btn.__t = setTimeout(function () {
+          btn.style.background = "rgba(0,212,255,.22)";
+          btn.style.borderColor = "rgba(0,212,255,.55)";
+          btn.style.color = "#00d4ff";
+          btn.textContent = orig;
+        }, 1300);
+      }
+      if (typeof window.toast === "function") window.toast(ok ? "📋 Copied" : "❌ Copy failed");
+    }
+
+    function findBubbles() {
+      var bubbles = new Set();
+      /* Method 1: walk up from every .msg-sndr to find its containing bubble */
+      document.querySelectorAll(".msg-sndr").forEach(function (sn) {
+        var node = sn.parentElement;
+        var depth = 0;
+        while (node && node !== document.body && depth < 8) {
+          /* bubble = parent that has the sender + body + visible card boundary */
+          var rect = node.getBoundingClientRect();
+          var hasBody = node.querySelector(".msg-txt") || (node.textContent || "").trim().length > 30;
+          var pid = (node.parentElement && node.parentElement.id) || "";
+          var isList = pid === "msgList" || pid === "amList" || (node.parentElement && /msg-list|am-scroll/.test(node.parentElement.className || ""));
+          if (hasBody && (isList || rect.height > 40)) {
+            bubbles.add(node);
+            break;
+          }
+          node = node.parentElement;
+          depth++;
+        }
+      });
+      /* Method 2: every direct child of #msgList / #amList / .msg-list / .am-scroll */
+      ["#msgList > *", "#amList > *", ".msg-list > *", ".am-scroll > *"].forEach(function (sel) {
+        try {
+          document.querySelectorAll(sel).forEach(function (n) {
+            if ((n.textContent || "").trim().length > 10) bubbles.add(n);
+          });
+        } catch (e) {}
+      });
+      return Array.from(bubbles);
+    }
+
+    function decorate(el) {
+      if (!el || el.__medBubBtn) return;
+      el.__medBubBtn = true;
+
+      /* Make sure bubble has positioning context for our absolute button */
+      var cs = getComputedStyle(el);
+      if (cs.position === "static") el.style.position = "relative";
+
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "med-bub-cpy";
+      btn.setAttribute("style", BTN_STYLE);
+      btn.textContent = "⎘ Copy";
+      btn.title = "Copy this message";
+      btn.addEventListener("mouseenter", function () {
+        btn.style.background = "rgba(0,212,255,.4)";
+        btn.style.transform = "translateY(-1px)";
+      });
+      btn.addEventListener("mouseleave", function () {
+        if (!btn.textContent.indexOf("✓")) return;
+        btn.style.background = "rgba(0,212,255,.22)";
+        btn.style.transform = "";
+      });
+      btn.addEventListener("click", function (e) {
+        e.preventDefault(); e.stopPropagation();
+        copyTo(clean(el), btn);
+      });
+      el.appendChild(btn);
+    }
+
+    function scan() {
+      var bubbles = findBubbles();
+      var added = 0;
+      bubbles.forEach(function (b) {
+        if (!b.__medBubBtn) { decorate(b); added++; }
+      });
+      if (added) console.log("[MED bubble-copy] decorated", added, "bubbles (total senders found:", document.querySelectorAll(".msg-sndr").length + ")");
+    }
+
+    [300, 800, 1500, 3000].forEach(function (ms) { setTimeout(scan, ms); });
+    setInterval(scan, 2000);
+
+    /* Watch entire body — catches messages no matter where they get rendered */
+    new MutationObserver(function () { scan(); }).observe(document.body, { childList: true, subtree: true });
+
+    console.log("[MED] Bubble copy buttons system initialized");
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     DOUBLE-CLICK ANY MESSAGE → COPIES IT (guaranteed fallback)
+     ═══════════════════════════════════════════════════════════════ */
+  function initDblClickCopy() {
+    if (window.__medDblCpy) return; window.__medDblCpy = true;
+
+    function clean(el) {
+      var c = el.cloneNode(true);
+      c.querySelectorAll("button,.med-cpy,.med-bub-cpy,.med-copy-chip,.med-reply-chip,.med-msg-actions,.med-copy-row,.med-badge,.med-otp-pill,[class*='time'],[class*='Time'],[class*='date'],[class*='Date']").forEach(function (e) { e.remove(); });
+      return (c.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function findMsg(el) {
+      var node = el;
+      var depth = 0;
+      while (node && node !== document.body && depth < 10) {
+        if (node.querySelector && node.querySelector(".msg-sndr")) {
+          /* this contains a sender — likely the bubble */
+          return node;
+        }
+        var pid = (node.parentElement && node.parentElement.id) || "";
+        if (pid === "msgList" || pid === "amList") return node;
+        node = node.parentElement; depth++;
+      }
+      return null;
+    }
+
+    document.addEventListener("dblclick", function (e) {
+      var msg = findMsg(e.target);
+      if (!msg) return;
+      var text = clean(msg);
+      if (!text) return;
+      try { navigator.clipboard.writeText(text); } catch (err) {
+        var ta = document.createElement("textarea");
+        ta.value = text; ta.style.cssText = "position:fixed;left:-9999px";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); } catch (e2) {}
+        ta.remove();
+      }
+      if (typeof window.toast === "function") window.toast("📋 Copied (double-click): " + text.slice(0, 50) + (text.length > 50 ? "…" : ""));
+      /* Visual flash */
+      var orig = msg.style.boxShadow;
+      msg.style.transition = "box-shadow .3s";
+      msg.style.boxShadow = "0 0 0 2px #00d4aa, 0 0 24px rgba(0,212,170,.5)";
+      setTimeout(function () { msg.style.boxShadow = orig; }, 600);
+    });
+
+    console.log("[MED] Double-click any message to copy it");
+  }
+
+  function initFloatingCopy() {
+    if (window.__medFloatCpy) return; window.__medFloatCpy = true;
+
+    var st = document.createElement("style");
+    st.textContent =
+      "#medFloatCpy{position:fixed;z-index:99999;background:linear-gradient(135deg,#00d4ff,#c084fc);" +
+        "color:#001020;border:0;border-radius:8px;padding:7px 14px;" +
+        "font-family:'Exo 2',sans-serif;font-size:11px;font-weight:900;letter-spacing:.8px;" +
+        "cursor:pointer;box-shadow:0 6px 20px rgba(0,212,255,.5),0 0 0 1px rgba(255,255,255,.1) inset;" +
+        "display:none;pointer-events:auto;transition:transform .2s cubic-bezier(.16,1,.3,1),opacity .15s;" +
+      "}" +
+      "#medFloatCpy:hover{transform:scale(1.06);box-shadow:0 8px 28px rgba(0,212,255,.7);}" +
+      "#medFloatCpy:active{transform:scale(.94);}" +
+      "#medFloatCpy.ok{background:linear-gradient(135deg,#00d4aa,#00aa70);}" +
+      "#medFloatRep{position:fixed;z-index:99999;background:linear-gradient(135deg,#c084fc,#8a4fd4);" +
+        "color:#fff;border:0;border-radius:8px;padding:7px 14px;" +
+        "font-family:'Exo 2',sans-serif;font-size:11px;font-weight:900;letter-spacing:.8px;" +
+        "cursor:pointer;box-shadow:0 6px 20px rgba(192,132,252,.5);" +
+        "display:none;pointer-events:auto;transition:transform .2s cubic-bezier(.16,1,.3,1);" +
+      "}" +
+      "#medFloatRep:hover{transform:scale(1.06);}";
+    document.head.appendChild(st);
+
+    var fab = document.createElement("button");
+    fab.id = "medFloatCpy"; fab.type = "button"; fab.textContent = "⎘ COPY";
+    document.body.appendChild(fab);
+
+    var fabRep = document.createElement("button");
+    fabRep.id = "medFloatRep"; fabRep.type = "button"; fabRep.textContent = "↩ REPLY";
+    document.body.appendChild(fabRep);
+
+    var currentMsg = null;
+    var hideTimer = null;
+
+    function findMsgContainer(el) {
+      if (!el || el === document.body) return null;
+      var node = el;
+      var depth = 0;
+      while (node && node !== document.body && depth < 12) {
+        var cls = (node.className || "") + "";
+        var pid = (node.parentElement && node.parentElement.id) || "";
+        /* Direct child of known message lists */
+        if (pid === "msgList" || pid === "amList") return node;
+        /* Has a message-bubble-ish class */
+        if (/\bmsg-bub|msg-row|msg-card|am-row|am-item|msgcard\b/i.test(cls)) return node;
+        /* Inside a known message pane and contains a .msg-txt or substantial text */
+        if ((node.id === "msgList" || node.id === "amList")) return null;
+        node = node.parentElement;
+        depth++;
+      }
+      return null;
+    }
+
+    function clean(el) {
+      var c = el.cloneNode(true);
+      c.querySelectorAll("button,.med-cpy,.med-copy-chip,.med-reply-chip,.med-msg-actions,.med-copy-row,.med-badge,.med-otp-pill,[class*='time'],[class*='Time'],[class*='date'],[class*='Date'],[class*='close'],[class*='del']").forEach(function (e) { e.remove(); });
+      return (c.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function show(msgEl) {
+      currentMsg = msgEl;
+      var r = msgEl.getBoundingClientRect();
+      fab.style.display = "inline-block";
+      fab.style.top = (r.top + 8) + "px";
+      fab.style.left = (r.right - 86) + "px";
+      var sender = msgEl.querySelector(".msg-sndr");
+      if (sender) {
+        fabRep.style.display = "inline-block";
+        fabRep.style.top = (r.top + 8) + "px";
+        fabRep.style.left = (r.right - 178) + "px";
+      } else {
+        fabRep.style.display = "none";
+      }
+    }
+    function hide() {
+      fab.style.display = "none"; fabRep.style.display = "none"; currentMsg = null;
+    }
+
+    document.addEventListener("mousemove", function (e) {
+      var msg = findMsgContainer(e.target);
+      if (msg && msg !== currentMsg) {
+        clearTimeout(hideTimer);
+        show(msg);
+      } else if (!msg && currentMsg) {
+        /* Don't hide if hovering the FAB itself */
+        if (e.target === fab || e.target === fabRep) return;
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(hide, 250);
+      }
+    });
+    [fab, fabRep].forEach(function (b) {
+      b.addEventListener("mouseenter", function () { clearTimeout(hideTimer); });
+      b.addEventListener("mouseleave", function () { hideTimer = setTimeout(hide, 250); });
+    });
+
+    fab.addEventListener("click", function (e) {
+      e.preventDefault(); e.stopPropagation();
+      if (!currentMsg) return;
+      var text = clean(currentMsg);
+      var ok = false;
+      try { navigator.clipboard.writeText(text); ok = true; } catch (err) {}
+      if (!ok) {
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.left = "-9999px";
+          document.body.appendChild(ta); ta.select();
+          ok = document.execCommand("copy"); ta.remove();
+        } catch (e2) {}
+      }
+      fab.classList.add("ok"); fab.textContent = "✓ COPIED";
+      setTimeout(function () { fab.classList.remove("ok"); fab.textContent = "⎘ COPY"; }, 1200);
+      if (typeof window.toast === "function") window.toast("📋 " + text.slice(0, 60) + (text.length > 60 ? "…" : ""));
+    });
+
+    fabRep.addEventListener("click", function (e) {
+      e.preventDefault(); e.stopPropagation();
+      if (!currentMsg) return;
+      var sender = currentMsg.querySelector(".msg-sndr");
+      if (!sender) return;
+      var num = sender.textContent.trim();
+      var to = document.getElementById("sTo"); var msg = document.getElementById("sMsg");
+      if (to) to.value = num;
+      var tab = document.querySelector('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
+      if (msg) setTimeout(function () { msg.focus(); }, 100);
+    });
+
+    /* Hide on scroll inside message lists */
+    ["msgList", "amList"].forEach(function (id) {
+      var c = document.getElementById(id);
+      if (c) c.addEventListener("scroll", function () { if (currentMsg) show(currentMsg); }, { passive: true });
+    });
+
+    console.log("[MED] Floating copy/reply buttons ready — hover any message to see them");
+  }
+  function initCopyButtons() {
+    if (window.__medCopyV3) return; window.__medCopyV3 = true;
+
+    var st = document.createElement("style");
+    st.id = "medCopyV3Style";
+    st.textContent =
+      ".med-cpy{" +
+        "display:inline-block!important;visibility:visible!important;opacity:1!important;" +
+        "margin:8px 6px 4px 0!important;padding:5px 13px!important;" +
+        "background:rgba(0,212,255,.2)!important;border:1px solid rgba(0,212,255,.55)!important;" +
+        "border-radius:7px!important;color:#00d4ff!important;" +
+        "font-size:11px!important;font-weight:800!important;letter-spacing:.5px!important;" +
+        "font-family:'Exo 2',sans-serif!important;cursor:pointer!important;" +
+        "line-height:1.2!important;z-index:50!important;position:relative!important;" +
+        "box-shadow:0 2px 8px rgba(0,212,255,.15)!important;" +
+        "transition:all .2s cubic-bezier(.16,1,.3,1)!important;" +
+      "}" +
+      ".med-cpy:hover{background:rgba(0,212,255,.35)!important;transform:translateY(-1px)!important;box-shadow:0 4px 14px rgba(0,212,255,.35)!important;}" +
+      ".med-cpy:active{transform:scale(.94)!important;}" +
+      ".med-cpy.ok{background:rgba(0,212,170,.3)!important;border-color:#00d4aa!important;color:#00d4aa!important;}" +
+      ".med-cpy-rep{background:rgba(192,132,252,.2)!important;border-color:rgba(192,132,252,.55)!important;color:#c084fc!important;}" +
+      ".med-cpy-rep:hover{background:rgba(192,132,252,.35)!important;}";
+    document.head.appendChild(st);
+
+    function cleanText(el) {
+      var c = el.cloneNode(true);
+      c.querySelectorAll(".med-cpy,.med-copy-chip,.med-reply-chip,.med-msg-actions,.med-copy-row,.med-badge,.med-otp-pill,button").forEach(function (e) { e.remove(); });
+      return (c.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function doCopy(text, btn) {
+      var ok = false;
+      try { navigator.clipboard.writeText(text); ok = true; } catch (e) {}
+      if (!ok) {
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.left = "-9999px";
+          document.body.appendChild(ta); ta.select();
+          ok = document.execCommand("copy"); ta.remove();
+        } catch (e) {}
+      }
+      if (btn) {
+        var orig = btn.textContent;
+        btn.classList.add("ok"); btn.textContent = "✓ Copied!";
+        clearTimeout(btn.__t);
+        btn.__t = setTimeout(function () { btn.classList.remove("ok"); btn.textContent = orig; }, 1300);
+      }
+      if (typeof window.toast === "function") window.toast(ok ? "📋 Copied to clipboard" : "❌ Copy failed");
+    }
+
+    function decorate(el) {
+      if (!el || el.nodeType !== 1 || el.__medCpyDone) return;
+      var text = cleanText(el);
+      if (!text || text.length < 3) return;
+      el.__medCpyDone = true;
+
+      var copy = document.createElement("button");
+      copy.className = "med-cpy";
+      copy.type = "button";
+      copy.textContent = "⎘ Copy";
+      copy.title = "Copy this message";
+      copy.addEventListener("click", function (e) {
+        e.preventDefault(); e.stopPropagation();
+        doCopy(cleanText(el), copy);
+      });
+      el.appendChild(copy);
+
+      var sender = el.querySelector(".msg-sndr");
+      if (sender) {
+        var rep = document.createElement("button");
+        rep.className = "med-cpy med-cpy-rep";
+        rep.type = "button";
+        rep.textContent = "↩ Reply";
+        rep.title = "Quick reply — fills Send SMS";
+        rep.addEventListener("click", function (e) {
+          e.preventDefault(); e.stopPropagation();
+          var num = sender.textContent.trim();
+          var to = document.getElementById("sTo"); var msg = document.getElementById("sMsg");
+          if (to) to.value = num;
+          var tab = document.querySelector('.tabs .tab[onclick*="sendsms"]'); if (tab) tab.click();
+          if (msg) setTimeout(function () { msg.focus(); }, 100);
+        });
+        el.appendChild(rep);
+      }
+    }
+
+    function scan() {
+      /* Cast a wide net — every reasonable message container */
+      var sels = [
+        "#msgList > *",
+        "#amList > *",
+        ".msg-list > *",
+        ".am-scroll > *",
+        "#pane-messages [class*='msg-bub']",
+        "#pane-messages [class*='msg-row']",
+        "#pane-messages [class*='msgcard']",
+        "#pane-allmsgs [class*='am-']",
+        "#pane-allmsgs [class*='msg']"
+      ];
+      var seen = new Set();
+      var added = 0;
+      sels.forEach(function (s) {
+        try {
+          document.querySelectorAll(s).forEach(function (el) {
+            if (seen.has(el)) return;
+            seen.add(el);
+            /* skip wrappers like sentinel/loader */
+            var id = el.id || ""; var cls = (el.className || "") + "";
+            if (/sentinel|loader|empty|ldwrap|simbar|msg-bar|msg-top/i.test(id + " " + cls)) return;
+            if (el.__medCpyDone) return;
+            decorate(el);
+            if (el.__medCpyDone) added++;
+          });
+        } catch (e) {}
+      });
+      if (added) console.log("[MED] Copy buttons added:", added);
+    }
+
+    /* Initial + observers + interval */
+    ["msgList", "amList"].forEach(function (id) {
+      var c = document.getElementById(id);
+      if (c) new MutationObserver(scan).observe(c, { childList: true, subtree: true });
+    });
+    var paneMsg = document.getElementById("pane-messages");
+    if (paneMsg) new MutationObserver(scan).observe(paneMsg, { childList: true, subtree: true });
+    var paneAll = document.getElementById("pane-allmsgs");
+    if (paneAll) new MutationObserver(scan).observe(paneAll, { childList: true, subtree: true });
+
+    [400, 1000, 2000, 4000].forEach(function (ms) { setTimeout(scan, ms); });
+    setInterval(scan, 2500);
+    console.log("[MED] Copy button system v3 initialized");
+  }
+
+  function initCopyButtonsLegacy() {
     /* Inline chip copy button — placed right next to .msg-txt so it can't be clipped */
     if (!document.getElementById("medCopyChipStyle")) {
       var s = document.createElement("style");
@@ -3732,6 +4191,136 @@ body{color:var(--text);font-family:'Exo 2',sans-serif;-webkit-font-smoothing:ant
       c.addEventListener("mouseleave", function () { tip.classList.remove("show"); });
     });
   }
+})();
+</script>
+<script>
+/* DEAD-SIMPLE COPY BUTTON — appended next to .msg-sndr (always visible) */
+(function () {
+  function add() {
+    var senders = document.querySelectorAll(".msg-sndr");
+    senders.forEach(function (s) {
+      if (s.__cpyDone) return;
+      s.__cpyDone = true;
+
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "⎘ COPY";
+      btn.setAttribute("style",
+        "all: revert !important;" +
+        "display: inline-block !important;" +
+        "visibility: visible !important;" +
+        "opacity: 1 !important;" +
+        "background: #00d4ff !important;" +
+        "color: #001020 !important;" +
+        "border: 0 !important;" +
+        "border-radius: 5px !important;" +
+        "padding: 3px 10px !important;" +
+        "margin: 0 8px !important;" +
+        "font-family: 'Exo 2', sans-serif !important;" +
+        "font-size: 10px !important;" +
+        "font-weight: 900 !important;" +
+        "letter-spacing: .5px !important;" +
+        "cursor: pointer !important;" +
+        "vertical-align: middle !important;" +
+        "line-height: 1.4 !important;" +
+        "box-shadow: 0 2px 8px rgba(0,212,255,.4) !important;" +
+        "white-space: nowrap !important;"
+      );
+
+      /* Walk up to the WHOLE bubble (direct child of msgList / amList / msg-list / am-scroll) */
+      function findBubble() {
+        var n = s;
+        var d = 0;
+        while (n && n.parentElement && n.parentElement !== document.body && d < 12) {
+          var p = n.parentElement;
+          var pid = p.id || "";
+          var pcls = (p.className || "") + "";
+          if (pid === "msgList" || pid === "amList") return n;
+          if (/\b(msg-list|am-scroll|msg-list-wrap|am-list)\b/.test(pcls)) return n;
+          n = p; d++;
+        }
+        return s.parentElement || s;
+      }
+
+      /* Extract just the message body — strip sender, tag, date via regex */
+      function extractBody() {
+        var bubble = findBubble();
+        var clone = bubble.cloneNode(true);
+
+        /* 1. Remove our buttons + obvious metadata DOM nodes */
+        clone.querySelectorAll(
+          "button," +
+          ".msg-sndr," +
+          ".med-cpy,.med-bub-cpy,.med-copy-chip,.med-reply-chip,.med-msg-actions,.med-copy-row,.med-badge,.med-otp-pill," +
+          "[class*='time'],[class*='Time'],[class*='date'],[class*='Date']," +
+          "[class*='pill'],[class*='Pill'],[class*='chip'],[class*='Chip']," +
+          "[class*='tag'],[class*='Tag'],[class*='badge'],[class*='Badge']"
+        ).forEach(function (x) { x.remove(); });
+
+        var raw = (clone.textContent || "").replace(/\s+/g, " ").trim();
+
+        /* 2. Strip the sender chip text (we know exactly what it is) */
+        var senderText = (s.textContent || "").trim();
+        if (senderText) {
+          raw = raw.split(senderText).join(" ");
+        }
+
+        /* 3. Strip direction keywords (anywhere, no boundary needed) */
+        raw = raw.replace(/incoming|outgoing/gi, " ");
+
+        /* 4. Strip date+time combos:
+              "10-05-2026 | 06:52 pm", "09-05-2026 | PM", "9/5/2026 12:00:00 AM" */
+        raw = raw.replace(/\d{1,2}[-/]\d{1,2}[-/]\d{2,4}[\s\|·•]*(\d{1,2}:?\d{0,2}(:\d{2})?)?\s*(am|pm)?/gi, " ");
+
+        /* 5. Strip any remaining bare time HH:MM[:SS] [am/pm] */
+        raw = raw.replace(/\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?/gi, " ");
+
+        /* 6. Strip orphan am/pm sitting alone */
+        raw = raw.replace(/(^|\s)(am|pm)(\s|$)/gi, " ");
+
+        /* 7. Strip leftover pipe separators */
+        raw = raw.replace(/\s*\|\s*/g, " ");
+
+        /* 8. Collapse + trim */
+        return raw.replace(/\s+/g, " ").trim();
+      }
+
+      btn.addEventListener("click", function (e) {
+        e.preventDefault(); e.stopPropagation();
+        var text = extractBody();
+        var ok = false;
+        try { navigator.clipboard.writeText(text); ok = true; } catch (err) {}
+        if (!ok) {
+          var ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.cssText = "position:fixed;left:-9999px";
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand("copy"); } catch (e2) {}
+          ta.remove();
+        }
+        btn.textContent = "✓ COPIED";
+        btn.style.setProperty("background", "#00d4aa", "important");
+        setTimeout(function () {
+          btn.textContent = "⎘ COPY";
+          btn.style.setProperty("background", "#00d4ff", "important");
+        }, 1100);
+      });
+
+      /* Insert immediately AFTER the sender chip */
+      if (s.nextSibling) s.parentNode.insertBefore(btn, s.nextSibling);
+      else s.parentNode.appendChild(btn);
+    });
+  }
+
+  function start() {
+    add();
+    setInterval(add, 1000);
+    new MutationObserver(add).observe(document.body, { childList: true, subtree: true });
+    console.log("[MED simple-copy] active — looking for .msg-sndr");
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
 })();
 </script>
 </body>
